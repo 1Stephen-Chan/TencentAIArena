@@ -143,9 +143,12 @@ class Algorithm:
         return total_loss, [value_loss, policy_loss, entropy_loss]
 
     def _masked_softmax(self, logits, legal_action):
-        """Masked softmax for legal actions.
+        """Masked softmax for legal actions with numerical stability.
 
-        对合法动作进行掩码 softmax。
+        合法动作掩码下的 softmax（数值稳定版）。
         """
-        masked_logits = logits + (1 - legal_action) * -1e10
-        return torch.softmax(masked_logits, dim=-1)
+        label_max, _ = torch.max(logits * legal_action, dim=1, keepdim=True)
+        label = logits - label_max
+        label = label * legal_action
+        label = label + 1e5 * (legal_action - 1)
+        return torch.nn.functional.softmax(label, dim=1)

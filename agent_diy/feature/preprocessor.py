@@ -470,12 +470,12 @@ class Preprocessor:
             rewards.append(0.02)
 
         if cur_min_dist < 0.2:
-            danger_penalty = (0.2 - cur_min_dist) * 0.05
+            danger_penalty = (0.2 - cur_min_dist) * 0.5
             if is_speedup:
                 danger_penalty *= 2.0
             rewards.append(-danger_penalty)
         elif cur_min_dist < 0.4 and is_speedup:
-            danger_penalty = (0.4 - cur_min_dist) * 0.025
+            danger_penalty = (0.4 - cur_min_dist) * 0.25
             rewards.append(-danger_penalty)
 
         is_flash = current_action >= 8

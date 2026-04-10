@@ -72,4 +72,9 @@ def _calc_gae(list_sample_data):
 
 
 def reward_shaping(frame_no, score, terminated, truncated, remain_info, _remain_info, obs, _obs):
-    pass
+    reward = 0.0
+    if terminated:
+        reward -= 5.0
+    elif truncated:
+        reward += 3.0
+    return np.array([reward], dtype=np.float32)

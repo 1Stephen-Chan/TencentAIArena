@@ -27,7 +27,7 @@ class Config:
     ACTION_SHAPE = (16,)
     VALUE_SHAPE = (1,)
 
-    GAMMA = 0.995
+    GAMMA = 0.95
     LAMDA = 0.95
     CLIP_PARAM = 0.2
     VF_COEF = 1.0
