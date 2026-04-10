@@ -41,10 +41,14 @@ class Preprocessor:
     def reset(self):
         self.step_no = 0
         self.max_step = 200
+        self.map_info = None
+        self.hero_pos = {"x": 0, "z": 0}
         self.last_min_monster_dist = 0.5
         self.last_treasure_dist = None
+        self.last_buff_dist = None
         self.last_buff_count = 0
         self.history_positions = []
+        self.visited_positions = set()
 
         self.monster_speedup_step = None
         self.second_monster_appear_step = None
@@ -66,6 +70,7 @@ class Preprocessor:
 
         self.step_no = observation["step_no"]
         self.max_step = env_info.get("max_step", 200)
+        self.map_info = map_info
 
         if map_info is not None:
             self.hero_center_x = len(map_info) // 2
@@ -73,6 +78,7 @@ class Preprocessor:
 
         hero = frame_state["heroes"]
         hero_pos = hero["pos"]
+        self.hero_pos = hero_pos
 
         flash_cooldown = env_info.get("flash_cooldown", 2000)
         flash_count = env_info.get("flash_count", 0)
@@ -382,7 +388,7 @@ class Preprocessor:
                 cur_min_dist = min(cur_min_dist, m_feat[0])
 
         for m in monsters:
-            real_dist = self._compute_real_distance(hero_pos, m["pos"], map_info, m)
+            real_dist = self._compute_real_distance(self.hero_pos, m["pos"], self.map_info, m)
             cur_min_dist = min(cur_min_dist, real_dist)
 
         if hasattr(self, 'last_min_monster_dist'):
@@ -405,7 +411,7 @@ class Preprocessor:
 
         if nearest_buff and hero["buff_remaining_time"] == 0:
             current_buff_dist = self._compute_real_distance(
-                hero_pos, nearest_buff["pos"], map_info, nearest_buff
+                self.hero_pos, nearest_buff["pos"], self.map_info, nearest_buff
             )
             if hasattr(self, 'last_buff_dist') and self.last_buff_dist is not None:
                 buff_delta = self.last_buff_dist - current_buff_dist
@@ -446,6 +452,7 @@ class Preprocessor:
             rewards.append(-danger_penalty)
 
         is_flash = current_action >= 8
+        gain = 0.0
         if is_flash:
             flash_dir = current_action - 8
             direction_vectors = [
@@ -454,28 +461,23 @@ class Preprocessor:
             ]
             dx, dz = direction_vectors[flash_dir]
             FLASH_DIST = 8.0
-            new_x = hero_pos["x"] + dx * FLASH_DIST
-            new_z = hero_pos["z"] + dz * FLASH_DIST
+            new_x = self.hero_pos["x"] + dx * FLASH_DIST
+            new_z = self.hero_pos["z"] + dz * FLASH_DIST
             new_hero_pos = {"x": new_x, "z": new_z}
 
-            gain = 0.0
             for m in monsters:
                 new_entity_data = {"is_in_view": 1}
-                new_dist = self._compute_real_distance(new_hero_pos, m["pos"], map_info, new_entity_data)
+                new_dist = self._compute_real_distance(new_hero_pos, m["pos"], self.map_info, new_entity_data)
                 gain = max(gain, new_dist - cur_min_dist)
 
+            rewards.append(-0.05)
+
             if is_speedup:
-                if gain > 0.25:
-                    rewards.append(0.3)
-                elif gain > 0.15:
-                    rewards.append(0.15)
-                else:
-                    rewards.append(-0.2)
+                if gain <= 0.15:
+                    rewards.append(-0.1)
             else:
-                if gain > 0.3:
-                    rewards.append(0.15)
-                else:
-                    rewards.append(-0.3)
+                if gain <= 0.3:
+                    rewards.append(-0.2)
 
         if self.step_no > monster_speedup_config:
             if hasattr(self, 'last_min_monster_dist'):
@@ -490,12 +492,12 @@ class Preprocessor:
                 if 2 <= dir_diff <= 6:
                     rewards.append(-0.15)
 
-        actual_dx = hero_pos["x"] - self.last_hero_pos["x"]
-        actual_dz = hero_pos["z"] - self.last_hero_pos["z"]
+        actual_dx = self.hero_pos["x"] - self.last_hero_pos["x"]
+        actual_dz = self.hero_pos["z"] - self.last_hero_pos["z"]
         if abs(actual_dx) < 0.1 and abs(actual_dz) < 0.1:
             rewards.append(-0.05)
         else:
-            current_pos = (int(hero_pos["x"]), int(hero_pos["z"]))
+            current_pos = (int(self.hero_pos["x"]), int(self.hero_pos["z"]))
             if not hasattr(self, 'visited_positions'):
                 self.visited_positions = set()
             if current_pos not in self.visited_positions:
