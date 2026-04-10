@@ -118,6 +118,7 @@ class EpisodeRunner:
         self.episode_cnt = 0
         self.last_report_monitor_time = 0
         self.last_get_training_metrics_time = 0
+        self.current_phase_index = 0
 
     def run_episodes(self):
         """Run a single episode and yield collected samples.
@@ -134,6 +135,7 @@ class EpisodeRunner:
 
             self.episode_cnt += 1
             phase = _get_curriculum_phase(self.episode_cnt)
+            self.current_phase_index = CURRICULUM_PHASES.index(phase)
             self.logger.info(f"Episode {self.episode_cnt} - Phase: {phase['name']}")
 
             conf = self._build_curriculum_conf(phase)
@@ -216,7 +218,7 @@ class EpisodeRunner:
                             "reward": round(total_reward + float(final_reward[0]), 4),
                             "episode_steps": step,
                             "episode_cnt": self.episode_cnt,
-                            "phase": phase["name"],
+                            "phase": self.current_phase_index,
                         }
                         self.monitor.put_data({os.getpid(): monitor_data})
                         self.last_report_monitor_time = now

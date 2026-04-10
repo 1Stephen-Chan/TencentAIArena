@@ -60,6 +60,12 @@ class Preprocessor:
         self.hero_center_x = 0
         self.hero_center_z = 0
 
+        self.last_seen_min_dist = 1.0
+        self.steps_since_last_seen = 0
+        self.last_seen_pos = None
+        self.estimated_threat_dist = 1.0
+        self.last_estimated_threat_dist = 1.0
+
     def feature_process(self, env_obs, last_action):
         """Process env_obs into feature vector, legal_action mask, and reward."""
         observation = env_obs["observation"]
@@ -191,7 +197,7 @@ class Preprocessor:
 
         reward = self._compute_reward(
             env_obs, hero, monster_feats, treasure_feat,
-            nearest_treasure, buffs, last_action, terrain_feat
+            nearest_treasure, nearest_buff, buffs, last_action, terrain_feat
         )
 
         self.last_hero_pos = hero_pos.copy() if hero_pos else None
@@ -216,7 +222,7 @@ class Preprocessor:
         return np.array(legal_action, dtype=np.float32)
 
     def _compute_real_distance(self, hero_pos, target_pos, map_info, entity_data):
-        """复合真实距离：BFS优先，不可达统一返回1.0"""
+        """复合真实距离：BFS优先，不可达时估计怪物沿通路移动的距离"""
         if map_info is None:
             return 1.0
 
@@ -230,11 +236,24 @@ class Preprocessor:
 
         if is_in_view:
             if (0 <= tx < len(map_info) and 0 <= tz < len(map_info[0])
+                and 0 <= hx < len(map_info) and 0 <= hz < len(map_info[0])
                 and map_info[tx][tz] != 0):
                 bfs_dist = self._bfs((hx, hz), (tx, tz), map_info)
                 if bfs_dist < float('inf'):
-                    return min(bfs_dist / 42.0, 1.0)
+                    self.last_seen_min_dist = min(bfs_dist / 42.0, 1.0)
+                    self.last_seen_pos = (tx, tz)
+                    self.steps_since_last_seen = 0
+                    return self.last_seen_min_dist
 
+        self.steps_since_last_seen += 1
+        if hasattr(self, 'last_seen_pos') and self.last_seen_pos is not None:
+            lx, lz = self.last_seen_pos
+            if 0 <= lx < len(map_info) and 0 <= lz < len(map_info[0]):
+                path_dist = self._bfs((hx, hz), (lx, lz), map_info)
+                if path_dist < float('inf'):
+                    self.estimated_threat_dist = min(path_dist / (len(map_info) * 0.5), 1.0)
+                    return self.estimated_threat_dist
+        self.estimated_threat_dist = 1.0
         return 1.0
 
     def _bfs(self, start, goal, map_info):
@@ -244,6 +263,8 @@ class Preprocessor:
         sx, sz = start
         gx, gz = goal
 
+        if not (0 <= sx < len(map_info) and 0 <= sz < len(map_info[0])):
+            return float('inf')
         if map_info[sx][sz] == 0:
             return float('inf')
 
@@ -353,7 +374,7 @@ class Preprocessor:
         return False
 
     def _compute_reward(self, env_obs, hero, monster_feats, treasure_feat,
-                       nearest_treasure, buffs, current_action, terrain_feat):
+                       nearest_treasure, nearest_buff, buffs, current_action, terrain_feat):
         """计算综合奖励"""
         rewards = []
         env_info = env_obs["observation"]["env_info"]
@@ -364,7 +385,7 @@ class Preprocessor:
         if hasattr(self, 'last_step_score'):
             step_score_diff = current_step_score - self.last_step_score
             if step_score_diff > 0:
-                rewards.append(step_score_diff * 0.1)
+                rewards.append(step_score_diff * 0.01)
         self.last_step_score = current_step_score
 
         current_treasure_score = hero["treasure_score"]
@@ -376,7 +397,7 @@ class Preprocessor:
 
         current_buff_count = len([b for b in buffs if b.get("status") == 1])
         if current_buff_count > self.last_buff_count:
-            rewards.append(0.5)
+            rewards.append(0.1)
         self.last_buff_count = current_buff_count
 
         monsters = env_obs.get("observation", {}).get("frame_state", {}).get("organs", [])
@@ -393,20 +414,26 @@ class Preprocessor:
 
         if hasattr(self, 'last_min_monster_dist'):
             dist_delta = self.last_min_monster_dist - cur_min_dist
-            dist_reward = 0.1 * dist_delta
+            dist_reward = 0.6 * dist_delta
             rewards.append(dist_reward)
 
             monster_speedup_config = env_info.get("monster_speed", 500)
             if self.step_no > monster_speedup_config:
-                rewards.append(dist_reward * 2.0)
+                rewards.append(dist_reward * 0.2)
         self.last_min_monster_dist = cur_min_dist
+
+        if self.steps_since_last_seen > 0:
+            threat_delta = self.estimated_threat_dist - self.last_estimated_threat_dist if hasattr(self, 'last_estimated_threat_dist') else 0
+            if threat_delta > 0:
+                rewards.append(threat_delta * 0.3)
+            self.last_estimated_threat_dist = self.estimated_threat_dist
 
         if nearest_treasure and treasure_feat[4] > 0:
             current_treasure_dist = treasure_feat[0]
             if hasattr(self, 'last_treasure_dist') and self.last_treasure_dist is not None:
                 treasure_delta = self.last_treasure_dist - current_treasure_dist
                 if treasure_delta > 0:
-                    rewards.append(treasure_delta * 0.5)
+                    rewards.append(treasure_delta * 0.15)
             self.last_treasure_dist = current_treasure_dist
 
         if nearest_buff and hero["buff_remaining_time"] == 0:
@@ -416,7 +443,7 @@ class Preprocessor:
             if hasattr(self, 'last_buff_dist') and self.last_buff_dist is not None:
                 buff_delta = self.last_buff_dist - current_buff_dist
                 if buff_delta > 0:
-                    rewards.append(buff_delta * 0.5)
+                    rewards.append(buff_delta * 0.1)
             self.last_buff_dist = current_buff_dist
 
         monster_speedup_config = env_info.get("monster_speed", 500)
@@ -428,27 +455,27 @@ class Preprocessor:
         is_open = terrain_feat[10] > 0
 
         if steps_until_speedup > 0 and steps_until_speedup < 100:
-            buffer_reward = 0.05 * (1.0 - steps_until_speedup / 100.0)
+            buffer_reward = 0.01 * (1.0 - steps_until_speedup / 100.0)
             if cur_min_dist < 0.5:
                 buffer_reward *= (1.0 + (0.5 - cur_min_dist))
             rewards.append(buffer_reward)
 
-        corridor_penalty = -0.1 if not is_speedup else -0.2
-        dead_penalty = -0.2 if not is_speedup else -0.4
+        corridor_penalty = -0.02 if not is_speedup else -0.03
+        dead_penalty = -0.02 if not is_speedup else -0.03
         if is_corridor:
             rewards.append(corridor_penalty)
         if is_dead:
             rewards.append(dead_penalty)
         if is_open and cur_min_dist < 0.3:
-            rewards.append(0.1)
+            rewards.append(0.02)
 
         if cur_min_dist < 0.2:
-            danger_penalty = (0.2 - cur_min_dist) * 0.5
+            danger_penalty = (0.2 - cur_min_dist) * 0.05
             if is_speedup:
                 danger_penalty *= 2.0
             rewards.append(-danger_penalty)
         elif cur_min_dist < 0.4 and is_speedup:
-            danger_penalty = (0.4 - cur_min_dist) * 0.25
+            danger_penalty = (0.4 - cur_min_dist) * 0.025
             rewards.append(-danger_penalty)
 
         is_flash = current_action >= 8
@@ -470,19 +497,19 @@ class Preprocessor:
                 new_dist = self._compute_real_distance(new_hero_pos, m["pos"], self.map_info, new_entity_data)
                 gain = max(gain, new_dist - cur_min_dist)
 
-            rewards.append(-0.05)
+            rewards.append(-0.01)
 
             if is_speedup:
                 if gain <= 0.15:
-                    rewards.append(-0.1)
+                    rewards.append(-0.02)
             else:
                 if gain <= 0.3:
-                    rewards.append(-0.2)
+                    rewards.append(-0.02)
 
         if self.step_no > monster_speedup_config:
             if hasattr(self, 'last_min_monster_dist'):
                 if cur_min_dist > self.last_min_monster_dist:
-                    rewards.append(0.2)
+                    rewards.append(0.05)
 
         if len(monsters) >= 2:
             m1_dir = monster_feats[0][1] if monster_feats[0][5] > 0 else -1
@@ -490,26 +517,27 @@ class Preprocessor:
             if m1_dir >= 0 and m2_dir >= 0:
                 dir_diff = abs(m1_dir - m2_dir)
                 if 2 <= dir_diff <= 6:
-                    rewards.append(-0.15)
+                    rewards.append(-0.02)
 
-        actual_dx = self.hero_pos["x"] - self.last_hero_pos["x"]
-        actual_dz = self.hero_pos["z"] - self.last_hero_pos["z"]
-        if abs(actual_dx) < 0.1 and abs(actual_dz) < 0.1:
-            rewards.append(-0.05)
-        else:
-            current_pos = (int(self.hero_pos["x"]), int(self.hero_pos["z"]))
-            if not hasattr(self, 'visited_positions'):
-                self.visited_positions = set()
-            if current_pos not in self.visited_positions:
-                self.visited_positions.add(current_pos)
-                rewards.append(0.02)
+        if self.last_hero_pos is not None:
+            actual_dx = self.hero_pos["x"] - self.last_hero_pos["x"]
+            actual_dz = self.hero_pos["z"] - self.last_hero_pos["z"]
+            if abs(actual_dx) < 0.1 and abs(actual_dz) < 0.1:
+                rewards.append(-0.01)
+            else:
+                current_pos = (int(self.hero_pos["x"]), int(self.hero_pos["z"]))
+                if not hasattr(self, 'visited_positions'):
+                    self.visited_positions = set()
+                if current_pos not in self.visited_positions:
+                    self.visited_positions.add(current_pos)
+                    rewards.append(0.01)
 
         if self._is_exploring_repeatedly():
-            rewards.append(-0.1)
+            rewards.append(-0.02)
 
         if len(monsters) >= 2:
             second_dist = monster_feats[1][0] if monster_feats[1][5] > 0 else 1.0
             if second_dist < 0.3:
-                rewards.append(-0.15)
+                rewards.append(-0.02)
 
         return [sum(rewards)]

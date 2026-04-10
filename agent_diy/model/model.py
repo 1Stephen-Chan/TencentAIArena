@@ -48,7 +48,6 @@ class Model(nn.Module):
         self.backbone = nn.Sequential(
             make_fc_layer(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.1),
             make_fc_layer(hidden_dim, mid_dim),
             nn.ReLU(),
         )

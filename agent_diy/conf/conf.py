@@ -31,7 +31,7 @@ class Config:
     LAMDA = 0.95
     CLIP_PARAM = 0.2
     VF_COEF = 1.0
-    ENTROPY_COEFF = 0.025
+    ENTROPY_COEFF = 0.001
     MAX_GRAD_NORM = 0.5
 
     START_LR = 3e-4
@@ -39,7 +39,7 @@ class Config:
     DECAY_TYPE = "linear"
 
     VALUE_LOSS_COEFF = 0.5
-    ENTROPY_LOSS_COEFF = 0.025
+    ENTROPY_LOSS_COEFF = 0.001
 
     EPSILON = 1e-8
     MAX_BUFFER_SIZE = 10000
