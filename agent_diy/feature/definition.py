@@ -118,6 +118,57 @@ def reward_shaping(
         elif cur_dist <= 3.0:
             reward -= 0.24
 
+        # 失去怪物视野时的远离奖励（基于地图评估）
+        if visible_monster_cnt <= 0:
+            last_monster_vec = remain_info.get("last_monster_vec", (0.0, 0.0))
+            steps_since_last_seen = int(_remain_info.get("steps_since_last_seen", 0))
+            away_scores = remain_info.get("away_scores", [0.0] * 8)
+            
+            if steps_since_last_seen < 50 and last_monster_vec != (0.0, 0.0):
+                # 获取当前移动方向（通过位置变化计算）
+                prev_x = float(remain_info.get("hero_x", 0.0))
+                prev_z = float(remain_info.get("hero_z", 0.0))
+                cur_x = float(_remain_info.get("hero_x", prev_x))
+                cur_z = float(_remain_info.get("hero_z", prev_z))
+                
+                dx = cur_x - prev_x
+                dz = cur_z - prev_z
+                move_dist = np.sqrt(dx * dx + dz * dz)
+                
+                if move_dist > 0.1:
+                    # 归一化移动方向
+                    move_vec = (dx / move_dist, dz / move_dist)
+                    # 远离方向（怪物方向的反方向）
+                    away_vec = (-last_monster_vec[0], -last_monster_vec[1])
+                    # 计算移动方向与远离方向的对齐程度
+                    away_align = move_vec[0] * away_vec[0] + move_vec[1] * away_vec[1]
+                    
+                    # 基础远离奖励（随时间衰减）
+                    if away_align > 0:
+                        away_reward = 0.20 * away_align * max(0.0, 1.0 - steps_since_last_seen / 50.0)
+                        reward += away_reward
+                    
+                    # 基于地图的额外奖励：如果移动方向是地图评估的最佳远离方向
+                    if away_scores and max(away_scores) > 0:
+                        # 找到最佳远离方向
+                        best_away_dir = np.argmax(away_scores)
+                        best_away_vec = _dir_to_vec(best_away_dir)
+                        align_with_best = move_vec[0] * best_away_vec[0] + move_vec[1] * best_away_vec[1]
+                        
+                        if align_with_best > 0.5:  # 与最佳方向对齐度高
+                            map_based_reward = 0.15 * align_with_best * max(0.0, 1.0 - steps_since_last_seen / 50.0)
+                            reward += map_based_reward
+                else:
+                    # 站着不动，给予惩罚
+                    reward -= 0.10 * max(0.0, 1.0 - steps_since_last_seen / 50.0)
+        
+        # 怪物靠近惩罚（有视野时）
+        if visible_monster_cnt > 0:
+            # 如果怪物距离在减小，给予惩罚
+            if cur_dist < prev_dist and cur_dist <= 5.0:
+                approach_penalty = 0.10 * (prev_dist - cur_dist) / max(cur_dist, 1.0)
+                reward -= approach_penalty
+
     # ----------------------------
     # 3) Event shaping: treasure, buff, flash quality
     # ----------------------------

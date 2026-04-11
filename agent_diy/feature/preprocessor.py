@@ -85,6 +85,9 @@ class Preprocessor:
         self.stuck_steps = 0
         self.visit_counter = {}
         self.monster_speedup_seen = False
+        self.last_monster_vec = None  # 最后已知怪物方向
+        self.last_monster_dist = Config.MAP_DIAG  # 最后已知怪物距离
+        self.steps_since_last_seen = 0  # 失去视野的步数
 
     def _parse_legal_action(self, legal_act_raw):
         legal = np.ones(Config.ACTION_NUM, dtype=np.float32)
@@ -363,6 +366,50 @@ class Preprocessor:
                 return float(tx), float(tz)
         return 0.0, 0.0
 
+    def _evaluate_away_direction(self, map_info, away_vec):
+        """评估基于完整地图的最佳远离方向，返回每个动作的可行性分数。"""
+        if not isinstance(map_info, list) or len(map_info) == 0 or away_vec is None:
+            return None
+        
+        rows = len(map_info)
+        cols = len(map_info[0]) if isinstance(map_info[0], list) else 0
+        if cols <= 0:
+            return None
+        
+        center_r = rows // 2
+        center_c = cols // 2
+        
+        # 评估8个方向的远离可行性
+        away_scores = np.zeros(8, dtype=np.float32)
+        
+        for direction in range(8):
+            dir_x, dir_z = ACTION_DIRS[direction]
+            # 计算该方向与远离方向的对齐度
+            align = dir_x * away_vec[0] + dir_z * away_vec[1]
+            
+            if align <= 0:
+                away_scores[direction] = 0.0
+                continue
+            
+            # 沿该方向检查可通行距离
+            max_passable_dist = 0
+            for dist in range(1, min(rows, cols) // 2):
+                check_r = center_r + int(round(dir_z * dist))
+                check_c = center_c + int(round(dir_x * dist))
+                
+                if 0 <= check_r < rows and 0 <= check_c < cols:
+                    if float(map_info[check_r][check_c]) != 0.0:
+                        max_passable_dist = dist
+                    else:
+                        break
+                else:
+                    break
+            
+            # 分数 = 方向对齐度 * 可通行距离
+            away_scores[direction] = align * min(max_passable_dist / 10.0, 1.0)
+        
+        return away_scores
+
     def _estimate_action_eval(
         self,
         map_info,
@@ -498,6 +545,30 @@ class Preprocessor:
             else Config.MAP_DIAG
         )
 
+        # 更新最后已知怪物位置记忆
+        if visible_monster_cnt > 0 and monster_local:
+            # 有怪物视野，更新最后已知位置
+            nearest_monster = min(monster_local, key=lambda x: x["dist"])
+            dx, dz = nearest_monster["dx"], nearest_monster["dz"]
+            dist = nearest_monster["dist"]
+            # 归一化方向向量
+            if dist > 0.1:
+                self.last_monster_vec = (dx / dist, dz / dist)
+                self.last_monster_dist = dist
+            self.steps_since_last_seen = 0
+        elif min_dist <= 10.0 and monster_local:
+            # 怪物很近但不在视野内（可能被墙挡住），也更新记忆
+            nearest_monster = min(monster_local, key=lambda x: x["dist"])
+            dx, dz = nearest_monster["dx"], nearest_monster["dz"]
+            dist = nearest_monster["dist"]
+            if dist > 0.1:
+                self.last_monster_vec = (dx / dist, dz / dist)
+                self.last_monster_dist = dist
+            self.steps_since_last_seen = 0
+        else:
+            # 失去视野，增加计数
+            self.steps_since_last_seen += 1
+
         (
             target_feat,
             treasures,
@@ -507,6 +578,12 @@ class Preprocessor:
             nearest_buff_vec,
             nearest_buff_dist_norm,
         ) = self._build_target_features(frame_state.get("organs", []))
+
+        # 评估基于地图的远离方向（失去视野时使用）
+        away_scores = None
+        if visible_monster_cnt <= 0 and self.last_monster_vec is not None:
+            map_info = observation.get("map_info", [])
+            away_scores = self._evaluate_away_direction(map_info, self.last_monster_vec)
 
         map_info = observation.get("map_info", [])
         map_feat = self._build_local_map_feature(map_info)
@@ -614,6 +691,9 @@ class Preprocessor:
             "action_treasure": action_treasure.tolist(),
             "action_buff": action_buff.tolist(),
             "last_action": int(last_action) if last_action is not None else -1,
+            "last_monster_vec": self.last_monster_vec if self.last_monster_vec else (0.0, 0.0),
+            "steps_since_last_seen": self.steps_since_last_seen,
+            "away_scores": away_scores.tolist() if away_scores is not None else [0.0] * 8,
         }
 
         return feature, legal_action.tolist(), remain_info

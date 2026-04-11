@@ -66,6 +66,8 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
             if should_start_best_save(now, training_start_time):
                 if best_model_selector.update_if_best(episode_summary):
                     agent.save_model(id=DEFAULT_BEST_MODEL_ID)
+                    # 更新下次定期保存时间，避免短时间内重复保存
+                    next_periodic_save_time = now + 60
 
             if now >= next_periodic_save_time:
                 agent.save_model()
@@ -215,7 +217,7 @@ class EpisodeRunner:
             # warmup_stable: 简单地图，稳定环境，让智能体学习基础操作
             env_conf["map"] = [1, 3, 4, 5]
             env_conf["map_random"] = True
-            env_conf["treasure_count"] = random.randint(9, 10)
+            env_conf["treasure_count"] = 2
             env_conf["buff_count"] = 2
             env_conf["monster_interval"] = random.randint(220, 300)
             env_conf["monster_speedup"] = random.randint(360, 460)
@@ -226,7 +228,7 @@ class EpisodeRunner:
             env_conf["map"] = [1, 3, 4, 5]
             env_conf["map_random"] = True
             env_conf["treasure_count"] = random.randint(8, 10)
-            env_conf["buff_count"] = random.randint(1, 2)
+            env_conf["buff_count"] = 2
             env_conf["monster_interval"] = random.randint(160, 280)
             env_conf["monster_speedup"] = random.randint(240, 420)
             env_conf["max_step"] = 2000
@@ -236,7 +238,7 @@ class EpisodeRunner:
             env_conf["map"] = [1, 3, 4, 5, 6, 8, 9]
             env_conf["map_random"] = True
             env_conf["treasure_count"] = random.randint(7, 10)
-            env_conf["buff_count"] = random.randint(1, 2)
+            env_conf["buff_count"] = 2
             env_conf["monster_interval"] = random.randint(120, 220)
             env_conf["monster_speedup"] = random.randint(180, 320)
             env_conf["max_step"] = 2000
@@ -246,7 +248,7 @@ class EpisodeRunner:
             env_conf["map"] = [1, 3, 4, 5, 6, 8, 9]
             env_conf["map_random"] = True
             env_conf["treasure_count"] = random.randint(6, 10)
-            env_conf["buff_count"] = random.randint(0, 2)
+            env_conf["buff_count"] = 2
             env_conf["monster_interval"] = random.randint(120, 320)
             env_conf["monster_speedup"] = random.randint(140, 420)
             env_conf["max_step"] = 2000

@@ -115,8 +115,43 @@ class Agent(BaseAgent):
             elif not speedup_active:
                 prior_logits[8:] -= 0.30
 
-            if visible_monster_cnt <= 0 and not speedup_active:
-                prior_logits[8:] -= 0.10
+            # 失去怪物视野时的处理（无论是否加速阶段都执行）
+            if visible_monster_cnt <= 0:
+                last_monster_vec = remain_info.get("last_monster_vec", (0.0, 0.0))
+                steps_since_last_seen = int(remain_info.get("steps_since_last_seen", 0))
+                away_scores = remain_info.get("away_scores", [0.0] * 8)
+                
+                if steps_since_last_seen < 50 and last_monster_vec != (0.0, 0.0):
+                    # 刚失去视野不久，引导远离最后已知位置
+                    away_vec = (-last_monster_vec[0], -last_monster_vec[1])  # 反方向
+                    away_logits = np.zeros(Config.ACTION_NUM, dtype=np.float32)
+                    
+                    for act in range(Config.ACTION_NUM):
+                        ax, az = self._action_vec(act)
+                        # 计算动作方向与远离方向的对齐程度
+                        align = ax * away_vec[0] + az * away_vec[1]
+                        away_logits[act] = max(0.0, align)  # 只奖励正向对齐
+                    
+                    # 结合地图评估的远离方向
+                    if max(away_scores) > 0:
+                        # 使用地图评估的最佳方向
+                        best_dir = np.argmax(away_scores)
+                        best_vec = self._dir_to_vec(best_dir)
+                        for act in range(8):  # 只考虑普通移动
+                            ax, az = self._action_vec(act)
+                            align = ax * best_vec[0] + az * best_vec[1]
+                            away_logits[act] += max(0.0, align) * 0.5
+                    
+                    # 根据失去视野的时间衰减引导强度（加速阶段权重更高）
+                    base_weight = 0.50 if speedup_active else 0.40
+                    away_weight = base_weight * max(0.0, 1.0 - steps_since_last_seen / 50.0)
+                    prior_logits += away_weight * away_logits
+                    
+                    # 明确抑制闪现（失去视野时不鼓励闪现）
+                    prior_logits[8:] -= 0.20
+                else:
+                    # 失去视野太久，正常探索，抑制闪现
+                    prior_logits[8:] -= 0.15
 
             prior_prob = self._legal_soft_max(prior_logits, legal)
             mix = 0.65 if (speedup_active or min_dist <= 4.0) else 0.28
@@ -201,3 +236,30 @@ class Agent(BaseAgent):
         if use_max:
             return int(np.argmax(probs))
         return int(np.argmax(np.random.multinomial(1, probs, size=1)))
+
+    def _action_vec(self, action):
+        """Convert action index to direction vector (x, z)."""
+        # 8 directions for normal move (0-7), 8 directions for flash (8-15)
+        # Directions: 0=E, 1=SE, 2=S, 3=SW, 4=W, 5=NW, 6=N, 7=NE
+        angle = (action % 8) * (np.pi / 4)
+        return (np.cos(angle), -np.sin(angle))
+
+    def _dir_to_vec(self, direction):
+        """方向编号转向量，与preprocessor保持一致。"""
+        # 0=overlap/invalid, 1=E, 2=NE, 3=N, 4=NW, 5=W, 6=SW, 7=S, 8=SE
+        table = {
+            0: (0.0, 0.0),
+            1: (1.0, 0.0),
+            2: (1.0, -1.0),
+            3: (0.0, -1.0),
+            4: (-1.0, -1.0),
+            5: (-1.0, 0.0),
+            6: (-1.0, 1.0),
+            7: (0.0, 1.0),
+            8: (1.0, 1.0),
+        }
+        x, z = table.get(int(direction), (0.0, 0.0))
+        n = np.sqrt(x * x + z * z)
+        if n < 1e-6:
+            return (0.0, 0.0)
+        return (x / n, z / n)
