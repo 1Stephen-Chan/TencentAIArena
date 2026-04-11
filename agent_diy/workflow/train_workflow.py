@@ -6,126 +6,89 @@
 """
 Author: Tencent AI Arena Authors
 
-Training workflow for Gorge Chase DIY Agent.
-峡谷追猎 DIY 智能体训练工作流。
-
-课程学习配置：
-- warmup_stable (0-150): 资源多、压力低，学会稳定推进
-- mid_pressure (151-500): 逐步增加难度
-- late_speedup_survival (501-900): 高压存活
-- hard_generalization (901+): 泛化挑战
+Training workflow for Gorge Chase DIY agent.
 """
 
 import os
 import time
+from copy import deepcopy
 
 import numpy as np
-from agent_diy.conf.conf import Config
-from agent_diy.feature.definition import SampleData, sample_process
+
+from agent_diy.feature.definition import SampleData, reward_shaping, sample_process
+from common_python.utils.workflow_disaster_recovery import handle_disaster_recovery
 from tools.metrics_utils import get_training_metrics
 from tools.train_env_conf_validate import read_usr_conf
-from common_python.utils.workflow_disaster_recovery import handle_disaster_recovery
+import random
 
-
-CURRICULUM_PHASES = [
-    {
-        "name": "warmup_stable",
-        "max_episode": 150,
-        "treasure_count": (9, 10),
-        "buff_count": (2, 2),
-        "monster_interval": (220, 300),
-        "monster_speedup": (360, 460),
-        "max_step": 2000,
-    },
-    {
-        "name": "mid_pressure",
-        "max_episode": 500,
-        "treasure_count": (8, 10),
-        "buff_count": (1, 2),
-        "monster_interval": (160, 280),
-        "monster_speedup": (240, 420),
-        "max_step": 2000,
-    },
-    {
-        "name": "late_speedup_survival",
-        "max_episode": 900,
-        "treasure_count": (7, 10),
-        "buff_count": (1, 2),
-        "monster_interval": (120, 220),
-        "monster_speedup": (180, 320),
-        "max_step": 2000,
-    },
-    {
-        "name": "hard_generalization",
-        "max_episode": float('inf'),
-        "treasure_count": (6, 10),
-        "buff_count": (0, 2),
-        "monster_interval": (120, 320),
-        "monster_speedup": (140, 420),
-        "max_step": 2000,
-    },
-]
-
-
-def _get_curriculum_phase(episode_cnt):
-    """Get current curriculum phase based on episode count."""
-    for phase in CURRICULUM_PHASES:
-        if episode_cnt <= phase["max_episode"]:
-            return phase
-    return CURRICULUM_PHASES[-1]
-
-
-def _sample_range(range_tuple):
-    """Sample a random integer from a (min, max) tuple."""
-    return np.random.randint(range_tuple[0], range_tuple[1] + 1)
+# 默认模型保存时间
+DEFAULT_PERIODIC_SAVE_SECS = 1800
+# 最优模型预热保存时间
+DEFAULT_BEST_SAVE_WARMUP_SECS = 1800
+DEFAULT_LATEST_MODEL_ID = "latest"
+DEFAULT_BEST_MODEL_ID = "best"
 
 
 def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
-    last_save_model_time = time.time()
-    env = envs[0]
-    agent = agents[0]
+    env, agent = envs[0], agents[0]
 
-    base_conf = read_usr_conf("agent_diy/conf/train_env_conf.toml", logger)
-    if base_conf is None:
+    usr_conf = read_usr_conf("agent_diy/conf/train_env_conf.toml", logger)
+    if usr_conf is None:
         logger.error("usr_conf is None, please check agent_diy/conf/train_env_conf.toml")
         return
 
     episode_runner = EpisodeRunner(
         env=env,
         agent=agent,
-        base_conf=base_conf,
+        usr_conf=usr_conf,
         logger=logger,
         monitor=monitor,
     )
+    best_model_selector = BestModelSelector(logger=logger)
+
+    training_start_time = time.time()
+    next_periodic_save_time = training_start_time + DEFAULT_PERIODIC_SAVE_SECS
+    if logger:
+        logger.info(
+            f"best model saving will start after {DEFAULT_BEST_SAVE_WARMUP_SECS} seconds, "
+            f"periodic save interval is {DEFAULT_PERIODIC_SAVE_SECS} seconds"
+        )
 
     while True:
-        for g_data in episode_runner.run_episodes():
+        for episode_result in episode_runner.run_episodes():
+            g_data = episode_result["sample_data"]
             agent.send_sample_data(g_data)
             g_data.clear()
 
+            episode_summary = episode_result["episode_summary"]
             now = time.time()
-            if now - last_save_model_time >= 1800:
+
+            if should_start_best_save(now, training_start_time):
+                if best_model_selector.update_if_best(episode_summary):
+                    agent.save_model(id=DEFAULT_BEST_MODEL_ID)
+
+            if now >= next_periodic_save_time:
                 agent.save_model()
-                last_save_model_time = now
+                next_periodic_save_time = get_next_periodic_save_time(
+                    current_time=now,
+                    previous_target_time=next_periodic_save_time,
+                    interval_secs=DEFAULT_PERIODIC_SAVE_SECS,
+                )
 
 
 class EpisodeRunner:
-    def __init__(self, env, agent, base_conf, logger, monitor):
+    def __init__(self, env, agent, usr_conf, logger, monitor):
         self.env = env
         self.agent = agent
-        self.base_conf = base_conf
+        self.usr_conf = usr_conf
         self.logger = logger
         self.monitor = monitor
+
         self.episode_cnt = 0
         self.last_report_monitor_time = 0
         self.last_get_training_metrics_time = 0
-        self.current_phase_index = 0
 
     def run_episodes(self):
-        """Run a single episode and yield collected samples.
-
-        执行单局对局并 yield 训练样本。
-        """
         while True:
             now = time.time()
             if now - self.last_get_training_metrics_time >= 60:
@@ -134,24 +97,19 @@ class EpisodeRunner:
                 if training_metrics is not None:
                     self.logger.info(f"training_metrics is {training_metrics}")
 
-            self.episode_cnt += 1
-            phase = _get_curriculum_phase(self.episode_cnt)
-            self.current_phase_index = CURRICULUM_PHASES.index(phase)
-            self.logger.info(f"Episode {self.episode_cnt} - Phase: {phase['name']}")
-
-            conf = self._build_curriculum_conf(phase)
-            env_obs = self.env.reset(conf)
-
+            # 课程学习
+            episode_usr_conf = self._build_curriculum_conf()
+            env_obs = self.env.reset(episode_usr_conf)
             if handle_disaster_recovery(env_obs, self.logger):
-                self.episode_cnt -= 1
                 continue
 
             self.agent.reset(env_obs)
-            self.agent.load_model(id="latest")
+            self.agent.load_model(id=DEFAULT_LATEST_MODEL_ID)
 
             obs_data, remain_info = self.agent.observation_process(env_obs)
 
             collector = []
+            self.episode_cnt += 1
             done = False
             step = 0
             total_reward = 0.0
@@ -162,81 +120,39 @@ class EpisodeRunner:
                 act_data = self.agent.predict(list_obs_data=[obs_data])[0]
                 act = self.agent.action_process(act_data)
 
-                env_reward, env_obs = self.env.step(act)
-
-                if handle_disaster_recovery(env_obs, self.logger):
+                env_reward, next_env_obs = self.env.step(act)
+                if handle_disaster_recovery(next_env_obs, self.logger):
                     break
 
-                terminated = env_obs["terminated"]
-                truncated = env_obs["truncated"]
-                step += 1
+                terminated = bool(next_env_obs["terminated"])
+                truncated = bool(next_env_obs["truncated"])
                 done = terminated or truncated
+                step += 1
 
-                _obs_data, _remain_info = self.agent.observation_process(env_obs)
+                next_obs_data, next_remain_info = self.agent.observation_process(next_env_obs)
 
-                reward = _remain_info.get("reward", 0.0)
-                # 处理标量或数组情况
-                if isinstance(reward, np.ndarray):
-                    reward_value = float(reward.item()) if reward.ndim == 0 else float(reward[0])
-                else:
-                    reward_value = float(reward)
-                total_reward += reward_value
 
-                final_reward = np.zeros(1, dtype=np.float32)
-                if done:
-                    env_info = env_obs["observation"]["env_info"]
-                    total_score = env_info.get("total_score", 0)
+                # 奖励塑性
+                reward = reward_shaping(
+                    frame_no=next_env_obs.get("frame_no", step),
+                    score=env_reward.get("reward", 0.0) if isinstance(env_reward, dict) else 0.0,
+                    terminated=terminated,
+                    truncated=truncated,
+                    remain_info=remain_info,
+                    _remain_info=next_remain_info,
+                    obs=env_obs,
+                    _obs=next_env_obs,
+                )
+                total_reward += float(reward[0])
 
-                    if terminated:
-                        final_reward[0] = -10.0
-                        result_str = "FAIL"
-                    else:
-                        final_reward[0] = 10.0
-                        result_str = "WIN"
-
-                    self.logger.info(
-                        f"[GAMEOVER] episode:{self.episode_cnt} steps:{step} "
-                        f"result:{result_str} sim_score:{total_score:.1f} "
-                        f"total_reward:{total_reward:.3f}"
-                    )
-
-                # 将字典特征展平为数组（用于存储）
-                obs_feature = self._flatten_feature_dict(obs_data.feature)
-                
-                # 验证维度
-                expected_dim = Config.FEATURE_VECTOR_SHAPE[0]
-                if obs_feature.shape[0] != expected_dim:
-                    self.logger.error(f"Feature dim mismatch: got {obs_feature.shape[0]}, expected {expected_dim}")
-                    self.logger.error(f"Hero: {len(obs_data.feature['hero'])}, Monsters: {len(obs_data.feature['monsters'].flatten())}, "
-                                    f"Treasures: {len(obs_data.feature['treasures'].flatten())}, Buffs: {len(obs_data.feature['buffs'].flatten())}, "
-                                    f"Progress: {len(obs_data.feature['progress'])}, Map: {len(obs_data.feature['map'].flatten())}")
-                
-                # 验证数据有效性
-                if np.isnan(obs_feature).any():
-                    self.logger.error("obs_feature contains NaN!")
-                    obs_feature = np.nan_to_num(obs_feature, nan=0.0)
-                if np.isinf(obs_feature).any():
-                    self.logger.error("obs_feature contains Inf!")
-                    obs_feature = np.nan_to_num(obs_feature, posinf=1.0, neginf=-1.0)
-                # 检查 reward_value 是否有效
-                if np.isnan(reward_value):
-                    self.logger.error("reward contains NaN!")
-                    reward_value = 0.0
-                if np.isinf(reward_value):
-                    self.logger.error("reward contains Inf!")
-                    reward_value = 0.0
-                
-                # 处理 act_data.action 可能是标量的情况
-                act_value = act_data.action[0] if isinstance(act_data.action, (list, np.ndarray, tuple)) else act_data.action
-                
                 frame = SampleData(
-                    obs=obs_feature,
+                    obs=np.array(obs_data.feature, dtype=np.float32),
                     legal_action=np.array(obs_data.legal_action, dtype=np.float32),
-                    act=np.array([float(act_value)], dtype=np.float32),
-                    reward=np.array([reward_value], dtype=np.float32),
+                    act=np.array([act_data.action[0]], dtype=np.float32),
+                    reward=np.array(reward, dtype=np.float32),
                     done=np.array([float(done)], dtype=np.float32),
                     reward_sum=np.zeros(1, dtype=np.float32),
-                    value=np.array([float(act_data.value)], dtype=np.float32),
+                    value=np.array(act_data.value, dtype=np.float32).flatten()[:1],
                     next_value=np.zeros(1, dtype=np.float32),
                     advantage=np.zeros(1, dtype=np.float32),
                     prob=np.array(act_data.prob, dtype=np.float32),
@@ -244,72 +160,136 @@ class EpisodeRunner:
                 collector.append(frame)
 
                 if done:
-                    if collector:
-                        collector[-1].reward = collector[-1].reward + final_reward
+                    env_info = next_env_obs.get("observation", {}).get("env_info", {})
+                    total_score = env_info.get("total_score", 0)
+                    result_str = "FAIL" if terminated else "WIN"
 
-                    now = time.time()
-                    if now - self.last_report_monitor_time >= 10 and self.monitor:
-                        monitor_data = {
-                            "reward": round(total_reward + float(final_reward[0]), 4),
-                            "episode_steps": step,
-                            "episode_cnt": self.episode_cnt,
-                            "phase": self.current_phase_index,
+                    self.logger.info(
+                        f"[GAMEOVER] episode:{self.episode_cnt} steps:{step} "
+                        f"result:{result_str} sim_score:{total_score:.1f} "
+                        f"total_reward:{total_reward:.3f}"
+                    )
+
+                    if collector:
+                        collector = sample_process(collector)
+
+                        now = time.time()
+                        if now - self.last_report_monitor_time >= 60 and self.monitor:
+                            monitor_data = {
+                                "reward": round(total_reward, 4),
+                                "episode_steps": step,
+                                "episode_cnt": self.episode_cnt,
+                                "sim_score": float(total_score),
+                            }
+                            self.monitor.put_data({os.getpid(): monitor_data})
+                            self.last_report_monitor_time = now
+
+                        yield {
+                            "sample_data": collector,
+                            "episode_summary": {
+                                "episode_cnt": self.episode_cnt,
+                                "episode_steps": step,
+                                "episode_reward": float(total_reward),
+                                "total_score": float(total_score),
+                                "success": not terminated,
+                            },
                         }
-                        self.monitor.put_data({os.getpid(): monitor_data})
-                        self.last_report_monitor_time = now
-
-                    if collector:
-                        sample_process(collector)
-                        yield collector
                     break
 
-                obs_data = _obs_data
-                remain_info = _remain_info
+                obs_data = next_obs_data
+                remain_info = next_remain_info
+                env_obs = next_env_obs
 
-    def _build_curriculum_conf(self, phase):
-        """Build environment config for current curriculum phase."""
-        conf = self.base_conf.copy() if hasattr(self.base_conf, 'copy') else dict(self.base_conf)
+    def _build_curriculum_conf(self):
+        """
+        课程学习 curriculum learning
+        """
+        conf = deepcopy(self.usr_conf)
+        env_conf = conf.get("env_conf", {})
+        if not isinstance(env_conf, dict):
+            return conf
 
-        treasure_count = _sample_range(phase["treasure_count"])
-        buff_count = _sample_range(phase["buff_count"])
-        monster_interval = _sample_range(phase["monster_interval"])
-        monster_speedup = _sample_range(phase["monster_speedup"])
-        max_step = phase["max_step"]
+        ep = int(self.episode_cnt)
 
-        if hasattr(conf, 'update'):
-            conf.update({
-                "treasure_count": treasure_count,
-                "buff_count": buff_count,
-                "monster_interval": monster_interval,
-                "monster_speedup": monster_speedup,
-                "max_step": max_step,
-            })
+        if ep < 150:
+            # warmup_stable: 简单地图，稳定环境，让智能体学习基础操作
+            env_conf["map"] = [1, 3, 4, 5]
+            env_conf["map_random"] = True
+            env_conf["treasure_count"] = random.randint(9, 10)
+            env_conf["buff_count"] = 2
+            env_conf["monster_interval"] = random.randint(220, 300)
+            env_conf["monster_speedup"] = random.randint(360, 460)
+            env_conf["max_step"] = 2000
+
+        elif ep < 500:
+            # mid_pressure: 增加压力，怪物出现更快
+            env_conf["map"] = [1, 3, 4, 5]
+            env_conf["map_random"] = True
+            env_conf["treasure_count"] = random.randint(8, 10)
+            env_conf["buff_count"] = random.randint(1, 2)
+            env_conf["monster_interval"] = random.randint(160, 280)
+            env_conf["monster_speedup"] = random.randint(240, 420)
+            env_conf["max_step"] = 2000
+
+        elif ep < 900:
+            # late_speedup_survival: 更快加速，考验生存能力
+            env_conf["map"] = [1, 3, 4, 5, 6, 8, 9]
+            env_conf["map_random"] = True
+            env_conf["treasure_count"] = random.randint(7, 10)
+            env_conf["buff_count"] = random.randint(1, 2)
+            env_conf["monster_interval"] = random.randint(120, 220)
+            env_conf["monster_speedup"] = random.randint(180, 320)
+            env_conf["max_step"] = 2000
+
         else:
-            conf["treasure_count"] = treasure_count
-            conf["buff_count"] = buff_count
-            conf["monster_interval"] = monster_interval
-            conf["monster_speedup"] = monster_speedup
-            conf["max_step"] = max_step
+            # hard_generalization: 
+            env_conf["map"] = [1, 3, 4, 5, 6, 8, 9]
+            env_conf["map_random"] = True
+            env_conf["treasure_count"] = random.randint(6, 10)
+            env_conf["buff_count"] = random.randint(0, 2)
+            env_conf["monster_interval"] = random.randint(120, 320)
+            env_conf["monster_speedup"] = random.randint(140, 420)
+            env_conf["max_step"] = 2000
 
+        conf["env_conf"] = env_conf
         return conf
 
-    def _flatten_feature_dict(self, feature_dict):
-        """将字典格式的特征展平为numpy数组.
-        
-        用于兼容SampleData的存储格式。
-        注意：不包含legal_action，因为SampleData有单独字段存储。
-        """
-        if isinstance(feature_dict, dict):
-            # 按顺序拼接所有特征（不含legal_action）
-            components = [
-                np.array(feature_dict['hero'], dtype=np.float32).flatten(),
-                np.array(feature_dict['monsters'], dtype=np.float32).flatten(),
-                np.array(feature_dict['treasures'], dtype=np.float32).flatten(),
-                np.array(feature_dict['buffs'], dtype=np.float32).flatten(),
-                np.array(feature_dict['progress'], dtype=np.float32).flatten(),
-                np.array(feature_dict['map'], dtype=np.float32).flatten(),
-            ]
-            return np.concatenate(components)
-        else:
-            # 已经是数组格式
-            return np.array(feature_dict, dtype=np.float32)
+
+class BestModelSelector:
+    def __init__(self, logger=None):
+        self.logger = logger
+        self.best_priority = None
+
+    def update_if_best(self, episode_summary):
+        priority = self._build_priority(episode_summary)
+        if self.best_priority is not None and priority <= self.best_priority:
+            return False
+
+        self.best_priority = priority
+        if self.logger:
+            self.logger.info(
+                f"new best model selected, episode:{episode_summary['episode_cnt']} "
+                f"reward:{episode_summary['episode_reward']:.3f} "
+                f"score:{episode_summary['total_score']:.1f} "
+                f"success:{episode_summary['success']}"
+            )
+        return True
+
+    def _build_priority(self, episode_summary):
+        return (
+            int(bool(episode_summary.get("success", False))),
+            float(episode_summary.get("episode_reward", float("-inf"))),
+            float(episode_summary.get("total_score", float("-inf"))),
+            -int(episode_summary.get("episode_steps", 0)),
+        )
+
+
+def should_start_best_save(current_time, training_start_time):
+    return (current_time - training_start_time) >= DEFAULT_BEST_SAVE_WARMUP_SECS
+
+
+def get_next_periodic_save_time(current_time, previous_target_time, interval_secs):
+    next_target_time = previous_target_time
+    while next_target_time <= current_time:
+        next_target_time += interval_secs
+    return next_target_time

@@ -6,27 +6,71 @@
 """
 Author: Tencent AI Arena Authors
 
-Structured Feature Preprocessor for Gorge Chase DIY Agent.
-结构化特征预处理：
-- 输出分组特征供网络处理
-- 标量特征、实体特征、地图特征分离
+Feature preprocessor for Gorge Chase DIY agent.
 """
 
+import math
 import numpy as np
-from collections import deque
+
 from agent_diy.conf.conf import Config
 
 
-MAP_SIZE = 128.0
-MAX_MONSTER_SPEED = 5.0
-MAX_FLASH_CD = 2000.0
-MAX_BUFF_DURATION = 50.0
+# 方向映射,用于移动和闪现
+ACTION_DIRS = [
+    # 0: 东 E (Right)
+    (1, 0),
+    # 1: 东北 NE (Right-Up)
+    (1, -1),
+    # 2: 北 N (Up)
+    (0, -1),
+    # 3: 西北 NW (Left-Up)
+    (-1, -1),
+    # 4: 西 W (Left)
+    (-1, 0),
+    # 5: 西南 SW (Left-Down)
+    (-1, 1),
+    # 6: 南 S (Down)
+    (0, 1),
+    # 7: 东南 SE (Right-Down)
+    (1, 1),
+]
 
 
 def _norm(v, v_max, v_min=0.0):
-    """Normalize value to [0, 1]."""
     v = float(np.clip(v, v_min, v_max))
-    return (v - v_min) / (v_max - v_min) if (v_max - v_min) > 1e-6 else 0.0
+    denom = float(v_max - v_min)
+    if abs(denom) < 1e-6:
+        return 0.0
+    return (v - v_min) / denom
+
+
+def _dir_to_vec(direction):
+    """
+    方向编号转向量
+    0=overlap/invalid, 1=E, 2=NE, 3=N, 4=NW, 5=W, 6=SW, 7=S, 8=SE
+    """
+    table = {
+        0: (0.0, 0.0),
+        1: (1.0, 0.0),
+        2: (1.0, -1.0),
+        3: (0.0, -1.0),
+        4: (-1.0, -1.0),
+        5: (-1.0, 0.0),
+        6: (-1.0, 1.0),
+        7: (0.0, 1.0),
+        8: (1.0, 1.0),
+    }
+    x, z = table.get(int(direction), (0.0, 0.0))
+    n = math.sqrt(x * x + z * z)
+    if n < 1e-6:
+        return 0.0, 0.0
+    return x / n, z / n
+
+
+def _action_vec(action_idx):
+    dx, dz = ACTION_DIRS[int(action_idx) % 8]
+    n = math.sqrt(dx * dx + dz * dz)
+    return dx / n, dz / n
 
 
 class Preprocessor:
@@ -35,441 +79,541 @@ class Preprocessor:
 
     def reset(self):
         self.step_no = 0
-        self.max_step = 200
-        self.map_info = None
-        self.hero_pos = {"x": 0, "z": 0}
-        self.last_min_monster_dist = 0.5
-        self.last_treasure_dist = None
-        self.last_buff_dist = None
-        self.last_buff_count = 0
-        self.history_positions = []
-        self.visited_positions = set()
+        self.max_step = 1000
+        self.prev_pos = None
+        self.prev_cell = None
+        self.stuck_steps = 0
+        self.visit_counter = {}
+        self.monster_speedup_seen = False
 
-        self.monster_speedup_step = None
-        self.second_monster_appear_step = None
+    def _parse_legal_action(self, legal_act_raw):
+        legal = np.ones(Config.ACTION_NUM, dtype=np.float32)
+        if (
+            isinstance(legal_act_raw, (list, tuple, np.ndarray))
+            and len(legal_act_raw) > 0
+        ):
+            first = legal_act_raw[0]
+            if isinstance(first, (bool, np.bool_)):
+                legal[:] = 1.0
+                for i in range(min(Config.ACTION_NUM, len(legal_act_raw))):
+                    legal[i] = 1.0 if bool(legal_act_raw[i]) else 0.0
+            else:
+                legal[:] = 0.0
+                for a in legal_act_raw:
+                    try:
+                        idx = int(a)
+                        if 0 <= idx < Config.ACTION_NUM:
+                            legal[idx] = 1.0
+                    except Exception:
+                        continue
 
-        self.last_hero_pos = None
-        self.last_flash_used = False
-        self.stuck_counter = 0
+        if float(np.sum(legal)) <= 0.0:
+            legal[:] = 1.0
+        return legal
 
-        self.hero_center_x = 0
-        self.hero_center_z = 0
+    def _extract_hero(self, frame_state, env_info):
+        heroes = frame_state.get("heroes", {})
+        if isinstance(heroes, list):
+            hero = heroes[0] if heroes else {}
+        elif isinstance(heroes, dict):
+            hero = heroes
+        else:
+            hero = {}
 
-        self.last_seen_min_dist = 1.0
-        self.steps_since_last_seen = 0
-        self.last_seen_pos = None
-        self.estimated_threat_dist = 1.0
-        self.last_estimated_threat_dist = 1.0
+        hero_pos = hero.get("pos", env_info.get("pos", {}))
+        if not isinstance(hero_pos, dict):
+            hero_pos = {}
 
-    def feature_process(self, env_obs, last_action):
-        """
-        Process env_obs into structured features.
-        输出结构化特征字典供网络处理。
-        """
-        observation = env_obs["observation"]
-        frame_state = observation["frame_state"]
-        env_info = observation["env_info"]
-        map_info = observation["map_info"]
-        legal_act_raw = observation["legal_action"]
+        hero_x = float(hero_pos.get("x", 0.0))
+        hero_z = float(hero_pos.get("z", 0.0))
+        return hero, hero_x, hero_z
 
-        self.step_no = observation["step_no"]
-        self.max_step = env_info.get("max_step", 200)
-        self.map_info = map_info
+    def _bucket_center_dist(self, bucket):
+        # bucket 0..5 over [0,180], use center value for approximation
+        centers = [15.0, 45.0, 75.0, 105.0, 135.0, 165.0]
+        b = int(np.clip(bucket, 0, 5))
+        return centers[b]
 
-        if map_info is not None:
-            self.hero_center_x = len(map_info) // 2
-            self.hero_center_z = len(map_info) // 2
+    def _update_explore_state(self, hero_x, hero_z):
+        cell_size = max(1.0, float(Config.EXPLORE_CELL_SIZE))
+        cell = (
+            int(math.floor(hero_x / cell_size)),
+            int(math.floor(hero_z / cell_size)),
+        )
+        visit_count = int(self.visit_counter.get(cell, 0)) + 1
+        is_new_area = 1.0 if visit_count == 1 else 0.0
+        self.visit_counter[cell] = visit_count
 
-        hero = frame_state["heroes"]
-        hero_pos = hero["pos"]
-        self.hero_pos = hero_pos
+        if self.prev_pos is None:
+            move_l1 = 0.0
+            self.stuck_steps = 0
+        else:
+            move_l1 = abs(hero_x - self.prev_pos[0]) + abs(hero_z - self.prev_pos[1])
+            if move_l1 < Config.STUCK_MOVE_THRESHOLD:
+                self.stuck_steps += 1
+            elif cell == self.prev_cell and move_l1 < (2.0 * Config.STUCK_MOVE_THRESHOLD):
+                self.stuck_steps += 1
+            else:
+                self.stuck_steps = max(0, self.stuck_steps - 2)
 
-        flash_cooldown = env_info.get("flash_cooldown", 2000)
-        flash_count = env_info.get("flash_count", 0)
+        self.prev_pos = (hero_x, hero_z)
+        self.prev_cell = cell
+        return cell, visit_count, is_new_area, float(move_l1)
 
-        # ========== 1. 英雄特征 [10维] ==========
-        hero_feat = self._extract_hero_features(hero, hero_pos, flash_cooldown, flash_count)
-        
-        # ========== 2. 怪物特征 [2, 8维] ==========
-        monsters = frame_state.get("monsters", [])
-        monster_feats = self._extract_monster_features(monsters, hero_pos, map_info)
-        
-        # ========== 3. 宝箱特征 [4, 4维] ==========
-        organs = frame_state.get("organs", [])
-        treasures = [o for o in organs if o.get("sub_type") == 1]
-        treasure_feats = self._extract_treasure_features(treasures, hero_pos, map_info)
-        
-        # ========== 4. Buff特征 [2, 4维] ==========
-        buffs = [o for o in organs if o.get("sub_type") == 2]
-        buff_feats = self._extract_buff_features(buffs, hero, hero_pos, map_info)
-        
-        # ========== 5. 进度特征 [6维] ==========
-        progress_feat = self._extract_progress_features(env_info, monster_feats)
-        
-        # ========== 6. 地图特征 [1, 21, 21] ==========
-        map_grid = self._extract_map_features(map_info, hero_pos)
-        
-        # ========== 7. 合法动作 [16维] ==========
-        legal_action = self._process_legal_action(legal_act_raw)
+    def _build_monster_features(self, monsters, hero_x, hero_z):
+        if isinstance(monsters, dict):
+            monsters = [monsters]
+        if not isinstance(monsters, list):
+            monsters = []
 
-        # 构建结构化特征字典
-        structured_features = {
-            'hero': hero_feat,
-            'monsters': monster_feats,
-            'treasures': treasure_feats,
-            'buffs': buff_feats,
-            'progress': progress_feat,
-            'map': map_grid,
-            'legal_action': legal_action,
-        }
+        feats = []
+        dists = []
+        monster_local = []
+        visible_monster_cnt = 0
+        max_monster_speed = 1.0
 
-        # 计算奖励
-        reward = self._compute_reward(
-            env_obs, hero, monster_feats, treasure_feats,
-            nearest_treasure=treasures[0] if treasures else None,
-            nearest_buff=buffs[0] if buffs else None,
-            buffs=buffs,
-            current_action=last_action,
-            terrain_feat=None,  # 地形信息已整合到map_grid
+        for i in range(2):
+            if i < len(monsters) and isinstance(monsters[i], dict):
+                m = monsters[i]
+                m_pos = m.get("pos", {})
+                has_pos = isinstance(m_pos, dict) and ("x" in m_pos) and ("z" in m_pos)
+
+                in_view = float(m.get("is_in_view", 1.0 if has_pos else 0.0))
+                speed = float(m.get("speed", 1.0))
+                max_monster_speed = max(max_monster_speed, speed)
+                if in_view > 0.5:
+                    visible_monster_cnt += 1
+                bucket = float(m.get("hero_l2_distance", 5.0))
+                rel_dir = int(m.get("hero_relative_direction", 0))
+                dir_x, dir_z = _dir_to_vec(rel_dir)
+
+                if has_pos:
+                    mx = float(m_pos.get("x", hero_x))
+                    mz = float(m_pos.get("z", hero_z))
+                    dx = mx - hero_x
+                    dz = mz - hero_z
+                    dist = math.sqrt(dx * dx + dz * dz)
+                else:
+                    dist = self._bucket_center_dist(bucket)
+                    dx = dir_x * dist
+                    dz = dir_z * dist
+
+                threat = 1.0 - _norm(dist, Config.MAP_DIAG)
+
+                feats.extend(
+                    [
+                        1.0,
+                        in_view,
+                        _norm(dist, Config.MAP_DIAG),
+                        _norm(bucket, 5.0),
+                        _norm(speed, Config.MAX_MONSTER_SPEED),
+                        dir_x,
+                        dir_z,
+                        float(np.clip(dx / 30.0, -1.0, 1.0)),
+                        float(np.clip(dz / 30.0, -1.0, 1.0)),
+                        threat,
+                    ]
+                )
+
+                dists.append(dist)
+                monster_local.append(
+                    {"dx": float(dx), "dz": float(dz), "speed": speed, "dist": dist}
+                )
+            else:
+                feats.extend([0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+                dists.append(Config.MAP_DIAG)
+
+        return (
+            np.array(feats, dtype=np.float32),
+            dists,
+            monster_local,
+            visible_monster_cnt,
+            float(max_monster_speed),
         )
 
-        self.last_hero_pos = hero_pos.copy()
-        return structured_features, legal_action, reward
+    def _build_target_features(self, organs):
+        if isinstance(organs, dict):
+            organs = [organs]
+        if not isinstance(organs, list):
+            organs = []
 
-    def _extract_hero_features(self, hero, hero_pos, flash_cooldown, flash_count):
-        """提取英雄特征 [10维]."""
-        return np.array([
-            hero_pos["x"] / MAP_SIZE,                    # 位置X
-            hero_pos["z"] / MAP_SIZE,                    # 位置Z
-            hero["treasure_score"] / 1000.0,             # 宝箱得分
-            hero["step_score"] / (self.max_step * 1.5),  # 步数得分
-            1.0 if hero["flash_cooldown"] == 0 else 0.0, # 闪现是否可用
-            hero["buff_remaining_time"] / MAX_BUFF_DURATION,  # buff剩余时间
-            flash_cooldown / MAX_FLASH_CD,               # 闪现CD进度
-            flash_count / 50.0,                          # 闪现次数
-            self.stuck_counter / 10.0,                   # 卡住计数
-            len(self.history_positions) / 100.0,         # 历史位置数
-        ], dtype=np.float32)
+        treasures = []
+        buffs = []
 
-    def _extract_monster_features(self, monsters, hero_pos, map_info):
-        """提取怪物特征 [2, 8维]."""
-        monster_feats = []
-        for i in range(Config.MAX_MONSTERS):
-            if i < len(monsters):
-                m = monsters[i]
-                is_in_view = float(m.get("is_in_view", 0))
-                speed = m.get("speed", 1) / MAX_MONSTER_SPEED
-                m_pos = m["pos"]
-                
-                real_dist_norm = self._compute_real_distance(hero_pos, m_pos, map_info, m)
-                direction = m.get("hero_relative_direction", 0) / 8.0
-                
-                # 计算威胁度
-                threat_level = self._compute_threat_level(real_dist_norm, speed, is_in_view)
-                
-                monster_feats.append([
-                    real_dist_norm,      # 归一化距离
-                    direction,           # 方向
-                    speed,               # 速度
-                    m_pos["x"] / MAP_SIZE,  # 位置X
-                    m_pos["z"] / MAP_SIZE,  # 位置Z
-                    is_in_view,          # 是否在视野
-                    threat_level,        # 威胁度
-                    1.0,                 # 存在标记
-                ])
-            else:
-                # 填充空怪物
-                monster_feats.append([0.0] * Config.MONSTER_FEATURE_DIM)
-        
-        return np.array(monster_feats, dtype=np.float32)
+        for organ in organs:
+            if not isinstance(organ, dict):
+                continue
 
-    def _extract_treasure_features(self, treasures, hero_pos, map_info):
-        """提取宝箱特征 [4, 4维]."""
-        treasure_feats = []
-        for i in range(Config.MAX_TREASURES):
-            if i < len(treasures):
-                t = treasures[i]
-                t_pos = t["pos"]
-                real_dist_norm = self._compute_real_distance(hero_pos, t_pos, map_info, t)
-                direction = t.get("hero_relative_direction", 0) / 8.0
-                
-                treasure_feats.append([
-                    real_dist_norm,      # 归一化距离
-                    direction,           # 方向
-                    1.0,                 # 存在标记
-                    1.0,                 # 价值（可扩展）
-                ])
-            else:
-                treasure_feats.append([0.0] * Config.TREASURE_FEATURE_DIM)
-        
-        return np.array(treasure_feats, dtype=np.float32)
+            status = int(organ.get("status", 1))
+            if status != 1:
+                continue
 
-    def _extract_buff_features(self, buffs, hero, hero_pos, map_info):
-        """提取Buff特征 [2, 4维]."""
-        buff_feats = []
-        for i in range(Config.MAX_BUFFS):
-            if i < len(buffs):
-                b = buffs[i]
-                b_pos = b["pos"]
-                real_dist_norm = self._compute_real_distance(hero_pos, b_pos, map_info, b)
-                direction = b.get("hero_relative_direction", 0) / 8.0
-                
-                buff_feats.append([
-                    real_dist_norm,      # 归一化距离
-                    direction,           # 方向
-                    1.0 if hero["buff_remaining_time"] > 0 else 0.0,  # 是否有buff
-                    1.0,                 # 存在标记
-                ])
-            else:
-                buff_feats.append([0.0] * Config.BUFF_FEATURE_DIM)
-        
-        return np.array(buff_feats, dtype=np.float32)
+            sub_type = int(organ.get("sub_type", 0))
+            dist_bucket = float(organ.get("hero_l2_distance", 5.0))
+            rel_dir = int(organ.get("hero_relative_direction", 0))
+            dir_x, dir_z = _dir_to_vec(rel_dir)
+            dist_norm = _norm(dist_bucket, 5.0)
 
-    def _extract_progress_features(self, env_info, monster_feats):
-        """提取进度特征 [6维]."""
-        monster_speedup_config = env_info.get("monster_speed", 500)
-        monster_interval = env_info.get("monster_interval", 300)
-        steps_until_speedup = max(0, monster_speedup_config - self.step_no) / monster_speedup_config
-        second_monster_coming = 1.0 if self.step_no >= monster_interval else 0.0
-        
-        treasures_collected = env_info.get("treasures_collected", 0)
-        collected_buff = env_info.get("collected_buff", 0)
-        
-        # 计算整体危险等级
-        danger_level = self._compute_danger_level(monster_feats)
-        
-        return np.array([
-            self.step_no / self.max_step,                # 进度
-            1.0 if self.step_no > monster_speedup_config else 0.0,  # 是否加速
-            danger_level,                                 # 危险等级
-            steps_until_speedup,                          # 距离加速步数
-            second_monster_coming,                        # 第二怪物是否出现
-            (treasures_collected + collected_buff) / 15.0,  # 收集进度
-        ], dtype=np.float32)
+            item = [1.0, dist_norm, dir_x, dir_z]
+            if sub_type == 1:
+                treasures.append(item)
+            elif sub_type == 2:
+                buffs.append(item)
 
-    def _extract_map_features(self, map_info, hero_pos):
-        """提取局部地图特征（map_info已是以英雄为中心的视野栅格）."""
-        if map_info is None:
-            return np.zeros((Config.MAP_CHANNELS, Config.MAP_SIZE, Config.MAP_SIZE), dtype=np.float32)
-        
-        # map_info 本身就是以英雄为中心的视野范围
-        # 直接转换为numpy数组，无需坐标转换
-        map_h = len(map_info)
-        map_w = len(map_info[0]) if map_info else 0
-        
-        # 创建固定大小的地图网格
-        map_grid = np.zeros((Config.MAP_SIZE, Config.MAP_SIZE), dtype=np.float32)
-        
-        # 将map_info复制到网格中心
-        start_i = (Config.MAP_SIZE - map_h) // 2
-        start_j = (Config.MAP_SIZE - map_w) // 2
-        
-        for i in range(min(map_h, Config.MAP_SIZE)):
-            for j in range(min(map_w, Config.MAP_SIZE)):
-                grid_i = start_i + i
-                grid_j = start_j + j
-                if 0 <= grid_i < Config.MAP_SIZE and 0 <= grid_j < Config.MAP_SIZE:
-                    # 可行走=1.0, 障碍=0.0
-                    map_grid[grid_i, grid_j] = 1.0 if map_info[i][j] != 0 else 0.0
-        
-        return map_grid.reshape(Config.MAP_CHANNELS, Config.MAP_SIZE, Config.MAP_SIZE)
+        treasures.sort(key=lambda x: x[1])
+        buffs.sort(key=lambda x: x[1])
 
-    def _compute_threat_level(self, dist_norm, speed, is_in_view):
-        """计算怪物威胁度 [0, 1]."""
-        if not is_in_view:
-            return 0.0
-        # 距离越近、速度越快，威胁越高
-        threat = (1.0 - dist_norm) * 0.7 + speed * 0.3
-        return min(threat, 1.0)
+        feat = []
+        for i in range(4):
+            feat.extend(treasures[i] if i < len(treasures) else [0.0, 1.0, 0.0, 0.0])
+        for i in range(4):
+            feat.extend(buffs[i] if i < len(buffs) else [0.0, 1.0, 0.0, 0.0])
 
-    def _compute_danger_level(self, monster_feats):
-        """计算整体危险等级."""
-        danger = 0.0
-        for m in monster_feats:
-            if len(m) >= 7:  # 确保有足够维度
-                dist = m[0]
-                threat = m[6] if len(m) > 6 else 0.0
-                exists = m[7] if len(m) > 7 else 0.0
-                if exists > 0.5:
-                    danger += (1.0 - dist) * (1.0 + threat)
-        return min(danger / 2.0, 1.0)  # 归一化到[0,1]
+        nearest_treasure_vec = None
+        nearest_treasure_dist_norm = 1.0
+        if treasures:
+            nearest_treasure_dist_norm = float(treasures[0][1])
+            nearest_treasure_vec = (float(treasures[0][2]), float(treasures[0][3]))
 
-    def _compute_real_distance(self, hero_pos, target_pos, map_info, entity_data):
-        """复合真实距离：BFS优先，视野外使用威胁估计."""
-        if map_info is None:
-            return 1.0
+        nearest_buff_vec = None
+        nearest_buff_dist_norm = 1.0
+        if buffs:
+            nearest_buff_dist_norm = float(buffs[0][1])
+            nearest_buff_vec = (float(buffs[0][2]), float(buffs[0][3]))
 
-        is_in_view = entity_data.get("is_in_view", 0) if isinstance(entity_data, dict) else 1
+        return (
+            np.array(feat, dtype=np.float32),
+            treasures,
+            buffs,
+            nearest_treasure_vec,
+            nearest_treasure_dist_norm,
+            nearest_buff_vec,
+            nearest_buff_dist_norm,
+        )
 
-        center = len(map_info) // 2
-        hx = int(hero_pos["x"] - self.hero_center_x + center)
-        hz = int(hero_pos["z"] - self.hero_center_z + center)
-        tx = int(target_pos["x"] - self.hero_center_x + center)
-        tz = int(target_pos["z"] - self.hero_center_z + center)
+    def _build_local_map_feature(self, map_info):
+        feat = np.zeros(25, dtype=np.float32)
 
-        if is_in_view:
-            if (0 <= tx < len(map_info) and 0 <= tz < len(map_info[0])
-                and 0 <= hx < len(map_info) and 0 <= hz < len(map_info[0])
-                and map_info[tx][tz] != 0):
-                bfs_dist = self._bfs((hx, hz), (tx, tz), map_info)
-                if bfs_dist < float('inf'):
-                    real_dist = min(bfs_dist / 42.0, 1.0)
-                    self.last_seen_min_dist = real_dist
-                    self.last_seen_pos = (tx, tz)
-                    self.steps_since_last_seen = 0
-                    return real_dist
+        if not isinstance(map_info, list) or len(map_info) == 0:
+            return feat
 
-        self.steps_since_last_seen += 1
-        if hasattr(self, 'last_seen_pos') and self.last_seen_pos is not None:
-            lx, lz = self.last_seen_pos
-            if 0 <= lx < len(map_info) and 0 <= lz < len(map_info[0]):
-                path_dist = self._bfs((hx, hz), (lx, lz), map_info)
-                if path_dist < float('inf'):
-                    self.estimated_threat_dist = min(path_dist / (len(map_info) * 0.5), 1.0)
-                    return self.estimated_threat_dist
-        self.estimated_threat_dist = 1.0
-        return 1.0
+        rows = len(map_info)
+        cols = len(map_info[0]) if isinstance(map_info[0], list) else 0
+        if cols <= 0:
+            return feat
 
-    def _bfs(self, start, goal, map_info):
-        """BFS计算最短路径."""
-        from collections import deque
-        if start == goal:
-            return 0
-        queue = deque([(start, 0)])
-        visited = {start}
-        directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-        
-        while queue:
-            (x, y), dist = queue.popleft()
-            for dx, dy in directions:
-                nx, ny = x + dx, y + dy
-                if (nx, ny) == goal:
-                    return dist + 1
-                if (0 <= nx < len(map_info) and 0 <= ny < len(map_info[0])
-                    and map_info[nx][ny] != 0 and (nx, ny) not in visited):
-                    visited.add((nx, ny))
-                    queue.append(((nx, ny), dist + 1))
-        return float('inf')
+        center_r = rows // 2
+        center_c = cols // 2
 
-    def _find_nearest_entity(self, entities, hero_pos):
-        """找到最近的实体."""
-        if not entities:
-            return None
-        nearest = min(entities, key=lambda e: e.get("hero_l2_distance", float('inf')))
-        return nearest
+        idx = 0
+        for r in range(center_r - 2, center_r + 3):
+            for c in range(center_c - 2, center_c + 3):
+                if 0 <= r < rows and 0 <= c < cols:
+                    feat[idx] = 1.0 if float(map_info[r][c]) != 0.0 else 0.0
+                idx += 1
 
-    def _process_legal_action(self, legal_act_raw):
-        """处理合法动作掩码."""
-        legal_action = np.zeros(16, dtype=np.float32)
-        for i in range(min(len(legal_act_raw), 16)):
-            legal_action[i] = float(legal_act_raw[i])
-        return legal_action
+        return feat
 
-    def _is_exploring_repeatedly(self):
-        """检测是否在重复探索."""
-        if len(self.history_positions) < 10:
-            return False
-        recent = self.history_positions[-10:]
-        if len(set(recent)) <= 3:
+    def _local_passable(self, map_info, dx, dz):
+        if not isinstance(map_info, list) or len(map_info) == 0:
             return True
-        return False
+        rows = len(map_info)
+        cols = len(map_info[0]) if isinstance(map_info[0], list) else 0
+        if cols <= 0:
+            return True
 
-    def _compute_reward(self, env_obs, hero, monster_feats, treasure_feats,
-                       nearest_treasure, nearest_buff, buffs, current_action, terrain_feat):
-        """计算综合奖励 - 与baseline1对齐.
-        
-        奖励组成：
-        1. 官方得分奖励（步数得分 + 宝箱得分）* 0.02
-        2. 安全塑形奖励（远离怪物）
-        3. 事件奖励（宝箱、buff、闪现）
-        4. 终局奖励
-        """
-        rewards = []
-        env_info = env_obs["observation"]["env_info"]
-        
-        # 获取当前和上一帧的数据用于计算差值
-        current_step_score = hero.get("step_score", 0)
-        current_treasure_score = hero.get("treasure_score", 0)
-        current_total_score = current_step_score + current_treasure_score
-        
-        # 获取上一帧的数据
-        if not hasattr(self, 'last_step_score'):
-            self.last_step_score = current_step_score
-            self.last_treasure_score = current_treasure_score
-            self.last_total_score = current_total_score
-            self.last_flash_cooldown = hero.get("flash_cooldown", 0)
-            self.last_min_monster_dist_raw = 64.0  # 默认地图对角线
-        
-        # ----------------------------
-        # 1) 官方得分奖励（与baseline1一致）
-        # ----------------------------
-        total_score_diff = current_total_score - self.last_total_score
-        # 缩放官方得分变化：step_delta通常1.5 -> +0.03, treasure_delta 100 -> +2.0
-        rewards.append(0.02 * total_score_diff)
-        
-        # ----------------------------
-        # 2) 安全塑形奖励（生存优先）
-        # ----------------------------
-        # 将归一化距离转换回原始距离（假设地图128x128）
-        if len(monster_feats) > 0 and len(monster_feats[0]) > 0:
-            cur_min_dist_normalized = monster_feats[0][0]  # [0, 1] 归一化
-            cur_min_dist_raw = cur_min_dist_normalized * 128.0  # 转换回原始距离
-            
-            # 计算距离变化并缩放（调整权重以平衡奖励）
-            dist_delta_raw = cur_min_dist_raw - self.last_min_monster_dist_raw
-            dist_delta_scaled = np.clip(dist_delta_raw / 10.0, -1.0, 1.0)  # 除以10（原来是20）
-            rewards.append(0.5 * dist_delta_scaled)  # 权重0.5（原来是0.18）
-            
-            # 近距离惩罚（与baseline1一致）
-            if cur_min_dist_raw <= 1.5:
-                rewards.append(-0.75)
-            elif cur_min_dist_raw <= 3.0:
-                rewards.append(-0.32)
-            
-            self.last_min_monster_dist_raw = cur_min_dist_raw
-        
-        # ----------------------------
-        # 3) 事件奖励：宝箱、buff、闪现
-        # ----------------------------
-        # 宝箱收集奖励
-        treasure_gain = int(current_treasure_score > self.last_treasure_score)
-        if treasure_gain > 0:
-            rewards.append(0.8 * treasure_gain)
-        
-        # Buff收集奖励
-        if nearest_buff and len(buffs) > self.last_buff_count:
-            rewards.append(0.25)
-        
-        # 闪现质量奖励（新增）
-        current_flash_cooldown = hero.get("flash_cooldown", 0)
-        flash_used = (current_flash_cooldown == 2000 and self.last_flash_cooldown < 2000)
-        if flash_used:
-            # 判断闪现质量：危险时远离怪物 = 好闪现，否则 = 浪费
-            if len(monster_feats) > 0 and len(monster_feats[0]) > 0:
-                cur_min_dist_normalized = monster_feats[0][0]
-                # 如果之前距离很近（危险）且现在远离了，就是好闪现
-                if hasattr(self, 'last_min_monster_dist_raw') and self.last_min_monster_dist_raw <= 4.0:
-                    if cur_min_dist_normalized * 128.0 > self.last_min_monster_dist_raw:
-                        rewards.append(0.30)  # 好的防御性闪现
-                    else:
-                        rewards.append(-0.10)  # 浪费的闪现
-                else:
-                    rewards.append(-0.10)  # 不必要的闪现
-        self.last_flash_cooldown = current_flash_cooldown
-        
-        # 更新上一帧数据
-        self.last_step_score = current_step_score
-        self.last_treasure_score = current_treasure_score
-        self.last_total_score = current_total_score
-        
-        # ----------------------------
-        # 4) 终局奖励（与baseline1一致）
-        # ----------------------------
-        done = env_obs.get("done", False)
-        if done:
-            if hero.get("hp", 0) <= 0:
-                rewards.append(-8.0)  # 死亡惩罚
-            elif self.step_no >= self.max_step:
-                rewards.append(4.0)   # 存活奖励
-        
-        return sum(rewards)
+        cr = rows // 2
+        cc = cols // 2
+
+        r = cr + int(round(dz))
+        c = cc + int(round(dx))
+
+        if 0 <= r < rows and 0 <= c < cols:
+            return float(map_info[r][c]) != 0.0
+        return True
+
+    def _simulate_move(self, map_info, speed, dir_dx, dir_dz):
+        cur_x, cur_z = 0.0, 0.0
+        speed = max(1, int(round(speed)))
+
+        for _ in range(speed):
+            nx = cur_x + dir_dx
+            nz = cur_z + dir_dz
+
+            if abs(dir_dx) == 1 and abs(dir_dz) == 1:
+                diag_ok = self._local_passable(map_info, nx, nz) and (
+                    self._local_passable(map_info, cur_x + dir_dx, cur_z)
+                    or self._local_passable(map_info, cur_x, cur_z + dir_dz)
+                )
+                if not diag_ok:
+                    break
+            else:
+                if not self._local_passable(map_info, nx, nz):
+                    break
+
+            cur_x, cur_z = nx, nz
+
+        return float(cur_x), float(cur_z)
+
+    def _simulate_flash(self, map_info, dir_dx, dir_dz, max_len):
+        for d in range(int(max_len), 0, -1):
+            tx = dir_dx * d
+            tz = dir_dz * d
+            if self._local_passable(map_info, tx, tz):
+                return float(tx), float(tz)
+        return 0.0, 0.0
+
+    def _estimate_action_eval(
+        self,
+        map_info,
+        legal_action,
+        hero_speed,
+        monster_local,
+        nearest_treasure_vec,
+        nearest_treasure_dist_norm,
+        nearest_buff_vec,
+        nearest_buff_dist_norm,
+        min_dist,
+        speedup_active,
+        hero_buff_active,
+    ):
+        safety = np.full(Config.ACTION_NUM, -1.0, dtype=np.float32)
+        treasure = np.full(Config.ACTION_NUM, -1.0, dtype=np.float32)
+        buff = np.full(Config.ACTION_NUM, -1.0, dtype=np.float32)
+
+        for act in range(Config.ACTION_NUM):
+            if legal_action[act] < 0.5:
+                continue
+
+            dir_dx, dir_dz = ACTION_DIRS[act % 8]
+
+            if act < 8:
+                dst_x, dst_z = self._simulate_move(map_info, hero_speed, dir_dx, dir_dz)
+                moved_dist = abs(dst_x) + abs(dst_z)
+            else:
+                max_len = 10 if (act % 2 == 0) else 8
+                dst_x, dst_z = self._simulate_flash(map_info, dir_dx, dir_dz, max_len)
+                moved_dist = abs(dst_x) + abs(dst_z)
+
+            if monster_local:
+                min_after = 1e9
+                for m in monster_local:
+                    dx = m["dx"] - dst_x
+                    dz = m["dz"] - dst_z
+                    d = math.sqrt(dx * dx + dz * dz) - 0.5 * float(m.get("speed", 1.0))
+                    min_after = min(min_after, d)
+            else:
+                min_after = Config.MAP_DIAG
+
+            s = float(np.clip((min_after - 2.0) / 8.0, -1.0, 1.0))
+            if act < 8 and moved_dist < 0.5:
+                s -= 0.35
+            if act >= 8 and min_dist > (5.0 if speedup_active else 6.0):
+                # Keep flash for emergencies when current risk is low
+                s -= 0.28 if not speedup_active else 0.12
+
+            t = 0.0
+            if nearest_treasure_vec is not None:
+                ax, az = _action_vec(act)
+                tx, tz = nearest_treasure_vec
+                align = float(ax * tx + az * tz)
+                dist_weight = float(np.clip(1.2 - nearest_treasure_dist_norm, 0.0, 1.0))
+                t = align * dist_weight
+                if act >= 8:
+                    t *= 0.65
+                if speedup_active:
+                    t *= 0.55
+                t *= 0.5 + 0.5 * float(np.clip(s, -1.0, 1.0))
+
+            b = 0.0
+            if nearest_buff_vec is not None and not hero_buff_active:
+                ax, az = _action_vec(act)
+                bx, bz = nearest_buff_vec
+                align = float(ax * bx + az * bz)
+                dist_weight = float(np.clip(1.2 - nearest_buff_dist_norm, 0.0, 1.0))
+                b = align * dist_weight
+                if act >= 8:
+                    b *= 0.50 if not speedup_active else 0.75
+                b *= 0.5 + 0.5 * float(np.clip(s, -1.0, 1.0))
+                if speedup_active:
+                    b *= 1.25
+
+            safety[act] = float(np.clip(s, -1.0, 1.0))
+            treasure[act] = float(np.clip(t, -1.0, 1.0))
+            buff[act] = float(np.clip(b, -1.0, 1.0))
+
+        return safety, treasure, buff
+
+    def feature_process(self, env_obs, last_action):
+        if not isinstance(env_obs, dict):
+            env_obs = {}
+
+        observation = env_obs.get("observation", {})
+        if not isinstance(observation, dict):
+            observation = {}
+
+        frame_state = observation.get("frame_state", {})
+        if not isinstance(frame_state, dict):
+            frame_state = {}
+
+        env_info = observation.get("env_info", {})
+        if not isinstance(env_info, dict):
+            env_info = {}
+
+        self.step_no = int(
+            observation.get("step_no", env_info.get("step_no", self.step_no))
+        )
+        self.max_step = int(env_info.get("max_step", self.max_step))
+
+        legal_raw = observation.get(
+            "legal_act", observation.get("legal_action", [True] * Config.ACTION_NUM)
+        )
+        legal_action = self._parse_legal_action(legal_raw)
+
+        hero, hero_x, hero_z = self._extract_hero(frame_state, env_info)
+        _, visit_count, is_new_area, move_l1 = self._update_explore_state(hero_x, hero_z)
+
+        flash_cd = float(hero.get("flash_cooldown", 0.0))
+        buff_remain = float(hero.get("buff_remaining_time", 0.0))
+        hero_speed = float(hero.get("speed", 1.0))
+        hero_buff_active = 1.0 if buff_remain > 0.5 else 0.0
+
+        (
+            monster_feat,
+            monster_dists,
+            monster_local,
+            visible_monster_cnt,
+            max_monster_speed,
+        ) = self._build_monster_features(
+            frame_state.get("monsters", []),
+            hero_x,
+            hero_z,
+        )
+        if max_monster_speed >= Config.MONSTER_SPEEDUP_THRESHOLD:
+            self.monster_speedup_seen = True
+        min_dist = float(min(monster_dists)) if monster_dists else Config.MAP_DIAG
+        second_dist = (
+            float(sorted(monster_dists)[1])
+            if len(monster_dists) > 1
+            else Config.MAP_DIAG
+        )
+
+        (
+            target_feat,
+            treasures,
+            buffs,
+            nearest_treasure_vec,
+            nearest_treasure_dist_norm,
+            nearest_buff_vec,
+            nearest_buff_dist_norm,
+        ) = self._build_target_features(frame_state.get("organs", []))
+
+        map_info = observation.get("map_info", [])
+        map_feat = self._build_local_map_feature(map_info)
+
+        action_safety, action_treasure, action_buff = self._estimate_action_eval(
+            map_info=map_info,
+            legal_action=legal_action,
+            hero_speed=hero_speed,
+            monster_local=monster_local,
+            nearest_treasure_vec=nearest_treasure_vec,
+            nearest_treasure_dist_norm=nearest_treasure_dist_norm,
+            nearest_buff_vec=nearest_buff_vec,
+            nearest_buff_dist_norm=nearest_buff_dist_norm,
+            min_dist=min_dist,
+            speedup_active=self.monster_speedup_seen,
+            hero_buff_active=bool(hero_buff_active),
+        )
+
+        total_treasure = float(env_info.get("total_treasure", max(1, len(treasures))))
+        treasure_cnt = int(
+            hero.get("treasure_collected_count", env_info.get("treasures_collected", 0))
+        )
+
+        total_buff = float(env_info.get("total_buff", 2.0))
+        buff_cnt = int(env_info.get("collected_buff", 0))
+
+        step_norm = _norm(float(self.step_no), float(max(1, self.max_step)))
+        remain_step_norm = _norm(
+            float(max(0, self.max_step - self.step_no)), float(max(1, self.max_step))
+        )
+
+        self_feat = np.array(
+            [
+                _norm(hero_x, Config.MAP_SIZE),
+                _norm(hero_z, Config.MAP_SIZE),
+                step_norm,
+                remain_step_norm,
+                _norm(flash_cd, Config.MAX_FLASH_CD),
+                _norm(buff_remain, Config.MAX_BUFF_DURATION),
+                _norm(hero_speed, Config.MAX_MONSTER_SPEED),
+                _norm(min_dist, Config.MAP_DIAG),
+                _norm(second_dist, Config.MAP_DIAG),
+                _norm(float(treasure_cnt), max(1.0, total_treasure)),
+            ],
+            dtype=np.float32,
+        )
+
+        action_eval_feat = np.concatenate([action_safety, action_treasure]).astype(
+            np.float32
+        )
+        risk_feat = np.array([1.0 - _norm(min_dist, Config.MAP_DIAG)], dtype=np.float32)
+
+        feature = np.concatenate(
+            [
+                self_feat,
+                monster_feat,
+                target_feat,
+                map_feat,
+                legal_action.astype(np.float32),
+                action_eval_feat,
+                risk_feat,
+            ]
+        ).astype(np.float32)
+
+        if feature.shape[0] != Config.FEATURE_LEN:
+            if feature.shape[0] > Config.FEATURE_LEN:
+                feature = feature[: Config.FEATURE_LEN]
+            else:
+                feature = np.concatenate(
+                    [
+                        feature,
+                        np.zeros(
+                            Config.FEATURE_LEN - feature.shape[0], dtype=np.float32
+                        ),
+                    ]
+                )
+
+        remain_info = {
+            "step_no": int(self.step_no),
+            "hero_x": hero_x,
+            "hero_z": hero_z,
+            "min_monster_dist": min_dist,
+            "second_monster_dist": second_dist,
+            "treasure_cnt": treasure_cnt,
+            "buff_cnt": buff_cnt,
+            "flash_cnt": int(env_info.get("flash_count", 0)),
+            "step_score": float(
+                hero.get("step_score", env_info.get("step_score", 0.0))
+            ),
+            "treasure_score": float(
+                hero.get("treasure_score", env_info.get("treasure_score", 0.0))
+            ),
+            "total_score": float(env_info.get("total_score", 0.0)),
+            "visible_monster_cnt": int(visible_monster_cnt),
+            "max_monster_speed": float(max_monster_speed),
+            "monster_speedup_seen": 1.0 if self.monster_speedup_seen else 0.0,
+            "hero_buff_active": float(hero_buff_active),
+            "nearest_treasure_dist_norm": float(nearest_treasure_dist_norm),
+            "nearest_buff_dist_norm": float(nearest_buff_dist_norm),
+            "visit_count": int(visit_count),
+            "is_new_area": float(is_new_area),
+            "stuck_steps": int(self.stuck_steps),
+            "move_l1": float(move_l1),
+            "action_safety": action_safety.tolist(),
+            "action_treasure": action_treasure.tolist(),
+            "action_buff": action_buff.tolist(),
+            "last_action": int(last_action) if last_action is not None else -1,
+        }
+
+        return feature, legal_action.tolist(), remain_info
