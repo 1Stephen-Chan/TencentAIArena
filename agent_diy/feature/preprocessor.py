@@ -376,83 +376,100 @@ class Preprocessor:
 
     def _compute_reward(self, env_obs, hero, monster_feats, treasure_feats,
                        nearest_treasure, nearest_buff, buffs, current_action, terrain_feat):
-        """计算综合奖励."""
+        """计算综合奖励 - 与baseline1对齐.
+        
+        奖励组成：
+        1. 官方得分奖励（步数得分 + 宝箱得分）* 0.02
+        2. 安全塑形奖励（远离怪物）
+        3. 事件奖励（宝箱、buff、闪现）
+        4. 终局奖励
+        """
         rewards = []
         env_info = env_obs["observation"]["env_info"]
-
-        # 生存奖励
-        rewards.append(0.01)
-
-        # 步数得分奖励
-        current_step_score = hero["step_score"]
-        if hasattr(self, 'last_step_score'):
-            step_score_diff = current_step_score - self.last_step_score
-            if step_score_diff > 0:
-                rewards.append(step_score_diff * 0.01)
-        self.last_step_score = current_step_score
-
-        # 宝箱得分奖励
-        current_treasure_score = hero["treasure_score"]
-        if hasattr(self, 'last_treasure_score'):
-            treasure_diff = current_treasure_score - self.last_treasure_score
-            if treasure_diff > 0:
-                rewards.append(treasure_diff * 1.0)
-        self.last_treasure_score = current_treasure_score
-
-        # 怪物距离奖励（使用第一只怪物的距离）
+        
+        # 获取当前和上一帧的数据用于计算差值
+        current_step_score = hero.get("step_score", 0)
+        current_treasure_score = hero.get("treasure_score", 0)
+        current_total_score = current_step_score + current_treasure_score
+        
+        # 获取上一帧的数据
+        if not hasattr(self, 'last_step_score'):
+            self.last_step_score = current_step_score
+            self.last_treasure_score = current_treasure_score
+            self.last_total_score = current_total_score
+            self.last_flash_cooldown = hero.get("flash_cooldown", 0)
+            self.last_min_monster_dist_raw = 64.0  # 默认地图对角线
+        
+        # ----------------------------
+        # 1) 官方得分奖励（与baseline1一致）
+        # ----------------------------
+        total_score_diff = current_total_score - self.last_total_score
+        # 缩放官方得分变化：step_delta通常1.5 -> +0.03, treasure_delta 100 -> +2.0
+        rewards.append(0.02 * total_score_diff)
+        
+        # ----------------------------
+        # 2) 安全塑形奖励（生存优先）
+        # ----------------------------
+        # 将归一化距离转换回原始距离（假设地图128x128）
         if len(monster_feats) > 0 and len(monster_feats[0]) > 0:
-            cur_min_dist = monster_feats[0][0]  # 第一只怪物的距离
-            dist_delta = self.last_min_monster_dist - cur_min_dist
-            dist_reward = 0.6 * dist_delta
-            rewards.append(dist_reward)
-            self.last_min_monster_dist = cur_min_dist
-
-        # 加速阶段额外奖励
-        monster_speedup_config = env_info.get("monster_speed", 500)
-        is_speedup = self.step_no > monster_speedup_config
-        if is_speedup and len(monster_feats) > 0:
-            rewards.append(dist_reward * 0.2)
-
-        # 视野外威胁奖励
-        if self.steps_since_last_seen > 0:
-            threat_delta = self.estimated_threat_dist - self.last_estimated_threat_dist
-            if threat_delta > 0:
-                rewards.append(threat_delta * 0.3)
-        self.last_estimated_threat_dist = self.estimated_threat_dist
-
-        # 宝箱接近奖励
-        if len(treasure_feats) > 0 and treasure_feats[0][2] > 0:  # 存在标记
-            current_treasure_dist = treasure_feats[0][0]
-            if hasattr(self, 'last_treasure_dist') and self.last_treasure_dist is not None:
-                treasure_delta = self.last_treasure_dist - current_treasure_dist
-                if treasure_delta > 0:
-                    rewards.append(treasure_delta * 0.15)
-            self.last_treasure_dist = current_treasure_dist
-
-        # 危险惩罚
-        if len(monster_feats) > 0 and len(monster_feats[0]) > 0:
-            cur_min_dist = monster_feats[0][0]
-            if cur_min_dist < 0.2:
-                danger_penalty = (0.2 - cur_min_dist) * 0.5
-                if is_speedup:
-                    danger_penalty *= 2.0
-                rewards.append(-danger_penalty)
-
+            cur_min_dist_normalized = monster_feats[0][0]  # [0, 1] 归一化
+            cur_min_dist_raw = cur_min_dist_normalized * 128.0  # 转换回原始距离
+            
+            # 计算距离变化并缩放（调整权重以平衡奖励）
+            dist_delta_raw = cur_min_dist_raw - self.last_min_monster_dist_raw
+            dist_delta_scaled = np.clip(dist_delta_raw / 10.0, -1.0, 1.0)  # 除以10（原来是20）
+            rewards.append(0.5 * dist_delta_scaled)  # 权重0.5（原来是0.18）
+            
+            # 近距离惩罚（与baseline1一致）
+            if cur_min_dist_raw <= 1.5:
+                rewards.append(-0.75)
+            elif cur_min_dist_raw <= 3.0:
+                rewards.append(-0.32)
+            
+            self.last_min_monster_dist_raw = cur_min_dist_raw
+        
+        # ----------------------------
+        # 3) 事件奖励：宝箱、buff、闪现
+        # ----------------------------
+        # 宝箱收集奖励
+        treasure_gain = int(current_treasure_score > self.last_treasure_score)
+        if treasure_gain > 0:
+            rewards.append(0.8 * treasure_gain)
+        
         # Buff收集奖励
         if nearest_buff and len(buffs) > self.last_buff_count:
-            rewards.append(0.5)
-        self.last_buff_count = len(buffs)
-
-        # 重复探索惩罚
-        if self._is_exploring_repeatedly():
-            rewards.append(-0.1)
-
-        # 终局奖励
+            rewards.append(0.25)
+        
+        # 闪现质量奖励（新增）
+        current_flash_cooldown = hero.get("flash_cooldown", 0)
+        flash_used = (current_flash_cooldown == 2000 and self.last_flash_cooldown < 2000)
+        if flash_used:
+            # 判断闪现质量：危险时远离怪物 = 好闪现，否则 = 浪费
+            if len(monster_feats) > 0 and len(monster_feats[0]) > 0:
+                cur_min_dist_normalized = monster_feats[0][0]
+                # 如果之前距离很近（危险）且现在远离了，就是好闪现
+                if hasattr(self, 'last_min_monster_dist_raw') and self.last_min_monster_dist_raw <= 4.0:
+                    if cur_min_dist_normalized * 128.0 > self.last_min_monster_dist_raw:
+                        rewards.append(0.30)  # 好的防御性闪现
+                    else:
+                        rewards.append(-0.10)  # 浪费的闪现
+                else:
+                    rewards.append(-0.10)  # 不必要的闪现
+        self.last_flash_cooldown = current_flash_cooldown
+        
+        # 更新上一帧数据
+        self.last_step_score = current_step_score
+        self.last_treasure_score = current_treasure_score
+        self.last_total_score = current_total_score
+        
+        # ----------------------------
+        # 4) 终局奖励（与baseline1一致）
+        # ----------------------------
         done = env_obs.get("done", False)
         if done:
-            if hero["hp"] <= 0:
-                rewards.append(-5.0)  # 死亡惩罚
+            if hero.get("hp", 0) <= 0:
+                rewards.append(-8.0)  # 死亡惩罚
             elif self.step_no >= self.max_step:
-                rewards.append(3.0)   # 存活奖励
-
+                rewards.append(4.0)   # 存活奖励
+        
         return sum(rewards)

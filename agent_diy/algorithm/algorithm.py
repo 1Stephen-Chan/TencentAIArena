@@ -39,6 +39,8 @@ class Algorithm:
         self.vf_coef = Config.VF_COEF
         self.clip_param = Config.CLIP_PARAM
         self.entropy_coef = Config.ENTROPY_COEFF
+        self.entropy_coef_start = Config.ENTROPY_COEFF
+        self.entropy_coef_end = Config.ENTROPY_COEFF * 0.1  # 衰减到10%
 
         self.last_report_monitor_time = 0
         self.train_step = 0
@@ -48,6 +50,9 @@ class Algorithm:
 
         训练入口：对一批 SampleData 执行 PPO 更新。
         """
+        if not list_sample_data:
+            return None
+
         # 显式转换为numpy数组再转为tensor，避免create_cls创建的类的问题
         obs = torch.FloatTensor(np.stack([f.obs for f in list_sample_data])).to(self.device)
         legal_action = torch.FloatTensor(np.stack([f.legal_action for f in list_sample_data])).to(self.device)
@@ -58,27 +63,43 @@ class Algorithm:
         old_value = torch.FloatTensor(np.stack([f.value for f in list_sample_data])).to(self.device)
         reward_sum = torch.FloatTensor(np.stack([f.reward_sum for f in list_sample_data])).to(self.device)
 
+        # 优势归一化 - 提高训练稳定性
+        advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-6)
+
         self.model.set_train_mode()
-        self.optimizer.zero_grad()
 
-        logits, value_pred = self.model(obs, legal_action=legal_action)
+        total_loss = None
+        info_list = None
 
-        total_loss, info_list = self._compute_loss(
-            logits=logits,
-            value_pred=value_pred,
-            legal_action=legal_action,
-            old_action=act,
-            old_prob=old_prob,
-            advantage=advantage,
-            old_value=old_value,
-            reward_sum=reward_sum,
-            reward=reward,
-        )
+        # PPO 多轮训练 - 提高数据利用率
+        for _ in range(Config.EPOCH):
+            self.optimizer.zero_grad()
 
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.parameters, Config.MAX_GRAD_NORM)
-        self.optimizer.step()
+            logits, value_pred = self.model(obs, legal_action=legal_action)
+
+            total_loss, info_list = self._compute_loss(
+                logits=logits,
+                value_pred=value_pred,
+                legal_action=legal_action,
+                old_action=act,
+                old_prob=old_prob,
+                advantage=advantage,
+                old_value=old_value,
+                reward_sum=reward_sum,
+                reward=reward,
+            )
+
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.parameters, Config.MAX_GRAD_NORM)
+            self.optimizer.step()
+
         self.train_step += 1
+
+        # Entropy 系数衰减 - 早期探索，后期稳定
+        self.entropy_coef = max(
+            self.entropy_coef_end,
+            self.entropy_coef_start * (0.99995 ** self.train_step)
+        )
 
         now = time.time()
         if now - self.last_report_monitor_time >= 10:  # 每10秒上报一次监控数据
