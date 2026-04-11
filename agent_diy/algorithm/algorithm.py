@@ -20,6 +20,7 @@ PPO algorithm implementation for Gorge Chase DIY Agent.
 import os
 import time
 
+import numpy as np
 import torch
 from agent_diy.conf.conf import Config
 
@@ -47,19 +48,20 @@ class Algorithm:
 
         训练入口：对一批 SampleData 执行 PPO 更新。
         """
-        obs = torch.stack([f.obs for f in list_sample_data]).to(self.device)
-        legal_action = torch.stack([f.legal_action for f in list_sample_data]).to(self.device)
-        act = torch.stack([f.act for f in list_sample_data]).to(self.device).view(-1, 1)
-        old_prob = torch.stack([f.prob for f in list_sample_data]).to(self.device)
-        reward = torch.stack([f.reward for f in list_sample_data]).to(self.device)
-        advantage = torch.stack([f.advantage for f in list_sample_data]).to(self.device)
-        old_value = torch.stack([f.value for f in list_sample_data]).to(self.device)
-        reward_sum = torch.stack([f.reward_sum for f in list_sample_data]).to(self.device)
+        # 显式转换为numpy数组再转为tensor，避免create_cls创建的类的问题
+        obs = torch.FloatTensor(np.stack([f.obs for f in list_sample_data])).to(self.device)
+        legal_action = torch.FloatTensor(np.stack([f.legal_action for f in list_sample_data])).to(self.device)
+        act = torch.FloatTensor(np.stack([f.act for f in list_sample_data])).to(self.device).view(-1, 1)
+        old_prob = torch.FloatTensor(np.stack([f.prob for f in list_sample_data])).to(self.device)
+        reward = torch.FloatTensor(np.stack([f.reward for f in list_sample_data])).to(self.device)
+        advantage = torch.FloatTensor(np.stack([f.advantage for f in list_sample_data])).to(self.device)
+        old_value = torch.FloatTensor(np.stack([f.value for f in list_sample_data])).to(self.device)
+        reward_sum = torch.FloatTensor(np.stack([f.reward_sum for f in list_sample_data])).to(self.device)
 
         self.model.set_train_mode()
         self.optimizer.zero_grad()
 
-        logits, value_pred = self.model(obs)
+        logits, value_pred = self.model(obs, legal_action=legal_action)
 
         total_loss, info_list = self._compute_loss(
             logits=logits,
@@ -79,16 +81,17 @@ class Algorithm:
         self.train_step += 1
 
         now = time.time()
-        if now - self.last_report_monitor_time >= 60:
+        if now - self.last_report_monitor_time >= 10:  # 每10秒上报一次监控数据
             results = {
                 "total_loss": round(total_loss.item(), 4),
                 "value_loss": round(info_list[0].item(), 4),
                 "policy_loss": round(info_list[1].item(), 4),
                 "entropy_loss": round(info_list[2].item(), 4),
                 "reward": round(reward.mean().item(), 4),
+                "train_step": self.train_step,
             }
             self.logger.info(
-                f"[train] total_loss:{results['total_loss']} "
+                f"[train] step:{self.train_step} total_loss:{results['total_loss']} "
                 f"policy_loss:{results['policy_loss']} "
                 f"value_loss:{results['value_loss']} "
                 f"entropy:{results['entropy_loss']}"
@@ -143,12 +146,9 @@ class Algorithm:
         return total_loss, [value_loss, policy_loss, entropy_loss]
 
     def _masked_softmax(self, logits, legal_action):
-        """Masked softmax for legal actions with numerical stability.
+        """Masked softmax for legal actions.
 
-        合法动作掩码下的 softmax（数值稳定版）。
+        对合法动作进行掩码 softmax。
         """
-        label_max, _ = torch.max(logits * legal_action, dim=1, keepdim=True)
-        label = logits - label_max
-        label = label * legal_action
-        label = label + 1e5 * (legal_action - 1)
-        return torch.nn.functional.softmax(label, dim=1)
+        masked_logits = logits + (1 - legal_action) * -1e10
+        return torch.softmax(masked_logits, dim=-1)

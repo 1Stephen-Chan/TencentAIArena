@@ -31,16 +31,16 @@ ActData = create_cls(
 
 SampleData = create_cls(
     "SampleData",
-    obs=Config.FEATURE_VECTOR_SHAPE[0],
-    legal_action=Config.ACTION_SHAPE[0],
-    act=1,
-    prob=Config.ACTION_SHAPE[0],
-    reward=1,
-    advantage=1,
-    value=1,
-    reward_sum=1,
-    done=1,
-    next_value=1,
+    obs=Config.FEATURE_VECTOR_SHAPE[0],  # 特征向量维度
+    legal_action=Config.ACTION_SHAPE[0],  # 合法动作掩码维度
+    act=1,  # 动作标量
+    prob=Config.ACTION_SHAPE[0],  # 动作概率维度
+    reward=1,  # 奖励标量
+    advantage=1,  # 优势标量
+    value=1,  # 价值标量
+    reward_sum=1,  # 奖励和标量
+    done=1,  # 是否结束标量
+    next_value=1,  # 下一状态价值标量
 )
 
 
@@ -72,9 +72,4 @@ def _calc_gae(list_sample_data):
 
 
 def reward_shaping(frame_no, score, terminated, truncated, remain_info, _remain_info, obs, _obs):
-    reward = 0.0
-    if terminated:
-        reward -= 5.0
-    elif truncated:
-        reward += 3.0
-    return np.array([reward], dtype=np.float32)
+    pass

@@ -20,6 +20,7 @@ import os
 import time
 
 import numpy as np
+from agent_diy.conf.conf import Config
 from agent_diy.feature.definition import SampleData, sample_process
 from tools.metrics_utils import get_training_metrics
 from tools.train_env_conf_validate import read_usr_conf
@@ -173,8 +174,13 @@ class EpisodeRunner:
 
                 _obs_data, _remain_info = self.agent.observation_process(env_obs)
 
-                reward = np.array(_remain_info.get("reward", [0.0]), dtype=np.float32)
-                total_reward += float(reward[0])
+                reward = _remain_info.get("reward", 0.0)
+                # 处理标量或数组情况
+                if isinstance(reward, np.ndarray):
+                    reward_value = float(reward.item()) if reward.ndim == 0 else float(reward[0])
+                else:
+                    reward_value = float(reward)
+                total_reward += reward_value
 
                 final_reward = np.zeros(1, dtype=np.float32)
                 if done:
@@ -194,14 +200,43 @@ class EpisodeRunner:
                         f"total_reward:{total_reward:.3f}"
                     )
 
+                # 将字典特征展平为数组（用于存储）
+                obs_feature = self._flatten_feature_dict(obs_data.feature)
+                
+                # 验证维度
+                expected_dim = Config.FEATURE_VECTOR_SHAPE[0]
+                if obs_feature.shape[0] != expected_dim:
+                    self.logger.error(f"Feature dim mismatch: got {obs_feature.shape[0]}, expected {expected_dim}")
+                    self.logger.error(f"Hero: {len(obs_data.feature['hero'])}, Monsters: {len(obs_data.feature['monsters'].flatten())}, "
+                                    f"Treasures: {len(obs_data.feature['treasures'].flatten())}, Buffs: {len(obs_data.feature['buffs'].flatten())}, "
+                                    f"Progress: {len(obs_data.feature['progress'])}, Map: {len(obs_data.feature['map'].flatten())}")
+                
+                # 验证数据有效性
+                if np.isnan(obs_feature).any():
+                    self.logger.error("obs_feature contains NaN!")
+                    obs_feature = np.nan_to_num(obs_feature, nan=0.0)
+                if np.isinf(obs_feature).any():
+                    self.logger.error("obs_feature contains Inf!")
+                    obs_feature = np.nan_to_num(obs_feature, posinf=1.0, neginf=-1.0)
+                # 检查 reward_value 是否有效
+                if np.isnan(reward_value):
+                    self.logger.error("reward contains NaN!")
+                    reward_value = 0.0
+                if np.isinf(reward_value):
+                    self.logger.error("reward contains Inf!")
+                    reward_value = 0.0
+                
+                # 处理 act_data.action 可能是标量的情况
+                act_value = act_data.action[0] if isinstance(act_data.action, (list, np.ndarray, tuple)) else act_data.action
+                
                 frame = SampleData(
-                    obs=np.array(obs_data.feature, dtype=np.float32),
+                    obs=obs_feature,
                     legal_action=np.array(obs_data.legal_action, dtype=np.float32),
-                    act=np.array([act_data.action[0]], dtype=np.float32),
-                    reward=reward,
+                    act=np.array([float(act_value)], dtype=np.float32),
+                    reward=np.array([reward_value], dtype=np.float32),
                     done=np.array([float(done)], dtype=np.float32),
                     reward_sum=np.zeros(1, dtype=np.float32),
-                    value=np.array(act_data.value, dtype=np.float32).flatten()[:1],
+                    value=np.array([float(act_data.value)], dtype=np.float32),
                     next_value=np.zeros(1, dtype=np.float32),
                     advantage=np.zeros(1, dtype=np.float32),
                     prob=np.array(act_data.prob, dtype=np.float32),
@@ -213,7 +248,7 @@ class EpisodeRunner:
                         collector[-1].reward = collector[-1].reward + final_reward
 
                     now = time.time()
-                    if now - self.last_report_monitor_time >= 60 and self.monitor:
+                    if now - self.last_report_monitor_time >= 10 and self.monitor:
                         monitor_data = {
                             "reward": round(total_reward + float(final_reward[0]), 4),
                             "episode_steps": step,
@@ -224,7 +259,7 @@ class EpisodeRunner:
                         self.last_report_monitor_time = now
 
                     if collector:
-                        collector = sample_process(collector)
+                        sample_process(collector)
                         yield collector
                     break
 
@@ -257,3 +292,24 @@ class EpisodeRunner:
             conf["max_step"] = max_step
 
         return conf
+
+    def _flatten_feature_dict(self, feature_dict):
+        """将字典格式的特征展平为numpy数组.
+        
+        用于兼容SampleData的存储格式。
+        注意：不包含legal_action，因为SampleData有单独字段存储。
+        """
+        if isinstance(feature_dict, dict):
+            # 按顺序拼接所有特征（不含legal_action）
+            components = [
+                np.array(feature_dict['hero'], dtype=np.float32).flatten(),
+                np.array(feature_dict['monsters'], dtype=np.float32).flatten(),
+                np.array(feature_dict['treasures'], dtype=np.float32).flatten(),
+                np.array(feature_dict['buffs'], dtype=np.float32).flatten(),
+                np.array(feature_dict['progress'], dtype=np.float32).flatten(),
+                np.array(feature_dict['map'], dtype=np.float32).flatten(),
+            ]
+            return np.concatenate(components)
+        else:
+            # 已经是数组格式
+            return np.array(feature_dict, dtype=np.float32)

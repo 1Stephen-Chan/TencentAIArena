@@ -58,7 +58,7 @@ class Agent(BaseAgent):
         """
         feature, legal_action, reward = self.preprocessor.feature_process(env_obs, self.last_action)
         obs_data = ObsData(
-            feature=list(feature),
+            feature=feature,
             legal_action=legal_action,
         )
         remain_info = {"reward": reward}
@@ -141,10 +141,12 @@ class Agent(BaseAgent):
 
         处理 ActData 转换为环境动作。
         """
+        # 处理可能是标量的情况
         if is_stochastic:
-            action = int(act_data.action[0])
+            action_value = act_data.action[0] if isinstance(act_data.action, (list, np.ndarray, tuple)) else act_data.action
         else:
-            action = int(act_data.d_action[0])
+            action_value = act_data.d_action[0] if isinstance(act_data.d_action, (list, np.ndarray, tuple)) else act_data.d_action
+        action = int(action_value)
         self.last_action = action
         return action
 
@@ -153,18 +155,76 @@ class Agent(BaseAgent):
 
         模型前向传播。
         """
-        feature_tensor = torch.FloatTensor(feature).to(self.device)
-        legal_action_tensor = torch.FloatTensor(legal_action).to(self.device)
+        # 将特征转换为张量（如果是numpy数组）
+        if isinstance(feature, dict):
+            feature_dict = {
+                'hero': torch.FloatTensor(feature['hero']).to(self.device) if 'hero' in feature else None,
+                'monsters': torch.FloatTensor(feature['monsters']).to(self.device) if 'monsters' in feature else None,
+                'treasures': torch.FloatTensor(feature['treasures']).to(self.device) if 'treasures' in feature else None,
+                'buffs': torch.FloatTensor(feature['buffs']).to(self.device) if 'buffs' in feature else None,
+                'progress': torch.FloatTensor(feature['progress']).to(self.device) if 'progress' in feature else None,
+                'map': torch.FloatTensor(feature['map']).to(self.device) if 'map' in feature else None,
+                'legal_action': torch.FloatTensor(legal_action).to(self.device),
+            }
+            # 添加batch维度
+            for key in ['hero', 'monsters', 'treasures', 'buffs', 'progress', 'map']:
+                if feature_dict[key] is not None:
+                    feature_dict[key] = feature_dict[key].unsqueeze(0)
+            feature_dict['legal_action'] = feature_dict['legal_action'].unsqueeze(0)
+        else:
+            # 兼容旧格式（展平向量）
+            feature_dict = torch.FloatTensor(feature).to(self.device).unsqueeze(0)
 
         with torch.no_grad():
-            logits, value = self.model(feature_tensor.unsqueeze(0))
+            logits, value = self.model(feature_dict)
             logits = logits.squeeze(0)
             value = value.squeeze(0).item()
 
+            legal_action_tensor = torch.FloatTensor(legal_action).to(self.device)
             masked_logits = logits + (1 - legal_action_tensor) * -1e10
             prob = torch.softmax(masked_logits, dim=-1)
 
         return logits, value, prob
+
+    def _flatten_features(self, feature_dict):
+        """将结构化特征字典展平为向量.
+        
+        Args:
+            feature_dict: 包含结构化特征的字典
+            
+        Returns:
+            numpy.ndarray: 展平后的特征向量
+        """
+        import numpy as np
+        
+        features = []
+        
+        # 按固定顺序拼接所有特征
+        # 1. 英雄特征 [10]
+        if 'hero' in feature_dict:
+            features.append(np.array(feature_dict['hero']).flatten())
+        
+        # 2. 怪物特征 [2, 8] -> [16]
+        if 'monsters' in feature_dict:
+            features.append(np.array(feature_dict['monsters']).flatten())
+        
+        # 3. 宝箱特征 [4, 4] -> [16]
+        if 'treasures' in feature_dict:
+            features.append(np.array(feature_dict['treasures']).flatten())
+        
+        # 4. Buff特征 [2, 4] -> [8]
+        if 'buffs' in feature_dict:
+            features.append(np.array(feature_dict['buffs']).flatten())
+        
+        # 5. 进度特征 [6]
+        if 'progress' in feature_dict:
+            features.append(np.array(feature_dict['progress']).flatten())
+        
+        # 6. 地图特征 [1, 21, 21] -> [441]
+        if 'map' in feature_dict:
+            features.append(np.array(feature_dict['map']).flatten())
+        
+        return np.concatenate(features)
 
     def _legal_sample(self, prob, use_max=False):
         """Sample action from legal action probability distribution.
