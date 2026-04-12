@@ -245,7 +245,7 @@ class EpisodeRunner:
 
         else:
             # hard_generalization: 
-            env_conf["map"] = [1, 3, 4, 5, 6, 8, 9]
+            env_conf["map"] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
             env_conf["map_random"] = True
             env_conf["treasure_count"] = random.randint(6, 10)
             env_conf["buff_count"] = 2
