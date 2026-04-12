@@ -124,13 +124,30 @@ class Agent(BaseAgent):
             elif not speedup_active:
                 prior_logits[8:] -= 0.30
 
+            # 保持前进方向（惯性）：如果上一步是移动动作，鼓励继续同方向
+            if self.last_action >= 0 and self.last_action < 8 and min_dist > 8.0:
+                # 怪物很远，鼓励保持当前移动方向
+                last_dir_x, last_dir_z = self._action_vec(self.last_action)
+                continue_logits = np.zeros(Config.ACTION_NUM, dtype=np.float32)
+                for act in range(8):  # 只考虑普通移动
+                    ax, az = self._action_vec(act)
+                    # 计算与上一步方向的相似度
+                    similarity = ax * last_dir_x + az * last_dir_z
+                    # 奖励相似方向，惩罚反向
+                    if similarity > 0:
+                        continue_logits[act] = similarity * 0.30
+                    elif similarity < -0.5:
+                        continue_logits[act] = similarity * 0.15
+                prior_logits += continue_logits
+            
             # 失去怪物视野时的处理（无论是否加速阶段都执行）
             if visible_monster_cnt <= 0:
                 last_monster_vec = remain_info.get("last_monster_vec", (0.0, 0.0))
                 steps_since_last_seen = int(remain_info.get("steps_since_last_seen", 0))
                 away_scores = remain_info.get("away_scores", [0.0] * 8)
                 
-                if steps_since_last_seen < 50 and last_monster_vec != (0.0, 0.0):
+                # 延长到 100 步
+                if steps_since_last_seen < 100 and last_monster_vec != (0.0, 0.0):
                     # 刚失去视野不久，引导远离最后已知位置
                     away_vec = (-last_monster_vec[0], -last_monster_vec[1])  # 反方向
                     away_logits = np.zeros(Config.ACTION_NUM, dtype=np.float32)
@@ -151,15 +168,25 @@ class Agent(BaseAgent):
                             align = ax * best_vec[0] + az * best_vec[1]
                             away_logits[act] += max(0.0, align) * 0.5
                     
-                    # 根据失去视野的时间衰减引导强度（加速阶段权重更高）
+                    # 根据失去视野的时间衰减引导强度（加速阶段权重更高）- 延长到100步
                     base_weight = 0.50 if speedup_active else 0.40
-                    away_weight = base_weight * max(0.0, 1.0 - steps_since_last_seen / 50.0)
+                    away_weight = base_weight * max(0.0, 1.0 - steps_since_last_seen / 100.0)
                     prior_logits += away_weight * away_logits
                     
                     # 明确抑制闪现（失去视野时不鼓励闪现）
                     prior_logits[8:] -= 0.20
                 else:
-                    # 失去视野太久，正常探索，抑制闪现
+                    # 失去视野太久，但怪物很远时，继续远离而不是站着不动
+                    if min_dist > 10.0 and last_monster_vec != (0.0, 0.0):
+                        # 继续引导远离，但权重较低
+                        away_vec = (-last_monster_vec[0], -last_monster_vec[1])
+                        away_logits = np.zeros(Config.ACTION_NUM, dtype=np.float32)
+                        for act in range(8):  # 只考虑普通移动
+                            ax, az = self._action_vec(act)
+                            align = ax * away_vec[0] + az * away_vec[1]
+                            away_logits[act] = max(0.0, align)
+                        prior_logits += 0.15 * away_logits
+                    # 抑制闪现
                     prior_logits[8:] -= 0.15
 
             prior_prob = self._legal_soft_max(prior_logits, legal)
@@ -254,21 +281,7 @@ class Agent(BaseAgent):
         return (np.cos(angle), -np.sin(angle))
 
     def _dir_to_vec(self, direction):
-        """方向编号转向量，与preprocessor保持一致。"""
-        # 0=overlap/invalid, 1=E, 2=NE, 3=N, 4=NW, 5=W, 6=SW, 7=S, 8=SE
-        table = {
-            0: (0.0, 0.0),
-            1: (1.0, 0.0),
-            2: (1.0, -1.0),
-            3: (0.0, -1.0),
-            4: (-1.0, -1.0),
-            5: (-1.0, 0.0),
-            6: (-1.0, 1.0),
-            7: (0.0, 1.0),
-            8: (1.0, 1.0),
-        }
-        x, z = table.get(int(direction), (0.0, 0.0))
-        n = np.sqrt(x * x + z * z)
-        if n < 1e-6:
-            return (0.0, 0.0)
-        return (x / n, z / n)
+        """方向编号转向量，与_action_vec保持一致。"""
+        # 方向: 0=E, 1=SE, 2=S, 3=SW, 4=W, 5=NW, 6=N, 7=NE
+        angle = (direction % 8) * (np.pi / 4)
+        return (np.cos(angle), -np.sin(angle))

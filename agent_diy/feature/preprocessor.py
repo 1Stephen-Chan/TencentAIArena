@@ -88,6 +88,7 @@ class Preprocessor:
         self.last_monster_vec = None  # 最后已知怪物方向
         self.last_monster_dist = Config.MAP_DIAG  # 最后已知怪物距离
         self.steps_since_last_seen = 0  # 失去视野的步数
+        self.last_move_vec = None  # 上一步移动方向（用于保持惯性）
 
     def _parse_legal_action(self, legal_act_raw):
         legal = np.ones(Config.ACTION_NUM, dtype=np.float32)
@@ -159,6 +160,14 @@ class Preprocessor:
             else:
                 self.stuck_steps = max(0, self.stuck_steps - 2)
 
+        # 更新上一步移动方向（用于保持惯性）
+        if self.prev_pos is not None:
+            dx = hero_x - self.prev_pos[0]
+            dz = hero_z - self.prev_pos[1]
+            dist = math.sqrt(dx * dx + dz * dz)
+            if dist > 0.1:
+                self.last_move_vec = (dx / dist, dz / dist)
+        
         self.prev_pos = (hero_x, hero_z)
         self.prev_cell = cell
         return cell, visit_count, is_new_area, float(move_l1)
@@ -380,11 +389,16 @@ class Preprocessor:
         center_r = rows // 2
         center_c = cols // 2
         
-        # 评估8个方向的远离可行性
+        # 评估8个方向的远离可行性（使用与_action_vec一致的方向定义）
+        # 方向: 0=E, 1=SE, 2=S, 3=SW, 4=W, 5=NW, 6=N, 7=NE
         away_scores = np.zeros(8, dtype=np.float32)
         
         for direction in range(8):
-            dir_x, dir_z = ACTION_DIRS[direction]
+            # 使用与 _action_vec 一致的方向计算
+            angle = direction * (np.pi / 4)
+            dir_x = np.cos(angle)
+            dir_z = -np.sin(angle)
+            
             # 计算该方向与远离方向的对齐度
             align = dir_x * away_vec[0] + dir_z * away_vec[1]
             
@@ -695,6 +709,7 @@ class Preprocessor:
             "last_monster_vec": self.last_monster_vec if self.last_monster_vec else (0.0, 0.0),
             "steps_since_last_seen": self.steps_since_last_seen,
             "away_scores": away_scores.tolist() if away_scores is not None else [0.0] * 8,
+            "last_move_vec": self.last_move_vec if self.last_move_vec else None,
         }
 
         return feature, legal_action.tolist(), remain_info
