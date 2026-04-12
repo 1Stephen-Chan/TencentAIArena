@@ -101,14 +101,23 @@ class Agent(BaseAgent):
                 if speedup_active:
                     buff_urgency = 3.0
 
+            # 检查是否有可见的 buff
+            nearest_buff_dist = float(remain_info.get("nearest_buff_dist_norm", 1.0))
+            has_visible_buff = nearest_buff_dist < 1.0 and not hero_buff_active
+            
             if speedup_active:
-                prior_logits = 2.0 * safety + 0.30 * treasure
-                if not hero_buff_active:
-                    prior_logits += 1.50 * buff_urgency * buff
+                # 加速阶段：如果有可见 buff，大幅降低 safety 权重，强制关注 buff
+                if has_visible_buff and nearest_buff_dist < 0.6:
+                    # buff 很近，强制优先吃 buff
+                    prior_logits = 0.50 * safety + 0.20 * treasure + 4.00 * buff
+                else:
+                    prior_logits = 2.0 * safety + 0.30 * treasure
+                    if not hero_buff_active:
+                        prior_logits += 2.50 * buff_urgency * buff
             else:
                 prior_logits = 1.15 * safety + 0.90 * treasure
                 if not hero_buff_active:
-                    prior_logits += 0.80 * buff_urgency * buff
+                    prior_logits += 1.50 * buff_urgency * buff
 
             if min_dist <= 4.0:
                 prior_logits[8:] += 0.35 * safety[8:]

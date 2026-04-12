@@ -12,6 +12,27 @@ from common_python.utils.common_func import create_cls
 import numpy as np
 from agent_diy.conf.conf import Config
 
+
+def _dir_to_vec(direction):
+    """方向编号转向量，与preprocessor保持一致。"""
+    # 0=overlap/invalid, 1=E, 2=NE, 3=N, 4=NW, 5=W, 6=SW, 7=S, 8=SE
+    table = {
+        0: (0.0, 0.0),
+        1: (1.0, 0.0),
+        2: (1.0, -1.0),
+        3: (0.0, -1.0),
+        4: (-1.0, -1.0),
+        5: (-1.0, 0.0),
+        6: (-1.0, 1.0),
+        7: (0.0, 1.0),
+        8: (1.0, 1.0),
+    }
+    x, z = table.get(int(direction), (0.0, 0.0))
+    n = np.sqrt(x * x + z * z)
+    if n < 1e-6:
+        return (0.0, 0.0)
+    return (x / n, z / n)
+
 # The create_cls function is used to dynamically create a class. The first parameter of the function is the type name,
 # and the remaining parameters are the attributes of the class, which should have a default value of None.
 # create_cls函数用于动态创建一个类，函数第一个参数为类型名称，剩余参数为类的属性，属性默认值应设为None
@@ -95,7 +116,8 @@ def reward_shaping(
         reward += 0.28 * float(dist_delta)
         reward += 0.04 * float(treasure_dist_delta)
         if not hero_buff_active:
-            reward += 0.35 * buff_urgency * float(buff_dist_delta)
+            # 大幅提高加速阶段靠近 buff 的奖励
+            reward += 0.80 * buff_urgency * float(buff_dist_delta)
 
         if cur_dist <= 1.5:
             reward -= 1.10
@@ -107,7 +129,8 @@ def reward_shaping(
         reward += 0.08 * float(dist_delta)
         reward += 0.20 * float(treasure_dist_delta)
         if not hero_buff_active:
-            reward += 0.25 * buff_urgency * float(buff_dist_delta)
+            # 提高非加速阶段靠近 buff 的奖励
+            reward += 0.50 * buff_urgency * float(buff_dist_delta)
         reward += 0.18 * is_new_area
 
         if visible_monster_cnt <= 0 and is_new_area > 0.5:
@@ -177,7 +200,8 @@ def reward_shaping(
     if treasure_gain > 0:
         reward += (1.10 if not speedup_active else 0.50) * treasure_gain
     if buff_gain > 0:
-        reward += (1.00 if not speedup_active else 1.80) * buff_gain
+        # 大幅提高 buff 奖励，确保优先级高于宝箱
+        reward += (3.00 if not speedup_active else 5.00) * buff_gain
 
     flash_gain = int(_remain_info.get("flash_cnt", 0) - remain_info.get("flash_cnt", 0))
     if flash_gain > 0:

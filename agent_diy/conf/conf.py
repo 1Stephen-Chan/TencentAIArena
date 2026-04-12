@@ -29,13 +29,14 @@ class Config:
 
     # -------------------------
     # Feature definition
-    # self(10) + monster(20) + target(32) + map(25) + legal(16) + action_eval(32) + risk(1)
+    # self(10) + monster(20) + target(32) + map(441) + legal(16) + action_eval(32) + risk(1)
     # target: treasure(4*4=16) + buff(4*4=16) = 32
+    # map: 21*21 = 441 (full vision range)
     # -------------------------
     SELF_DIM = 10
     MONSTER_DIM = 20
     TARGET_DIM = 32
-    MAP_DIM = 25
+    MAP_DIM = 441
     LEGAL_DIM = 16
     ACTION_EVAL_DIM = 32
     RISK_DIM = 1

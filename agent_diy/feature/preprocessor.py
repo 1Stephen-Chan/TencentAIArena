@@ -295,7 +295,8 @@ class Preprocessor:
         )
 
     def _build_local_map_feature(self, map_info):
-        feat = np.zeros(25, dtype=np.float32)
+        # 提取完整的21×21视野地图 (441维)
+        feat = np.zeros(441, dtype=np.float32)
 
         if not isinstance(map_info, list) or len(map_info) == 0:
             return feat
@@ -309,8 +310,8 @@ class Preprocessor:
         center_c = cols // 2
 
         idx = 0
-        for r in range(center_r - 2, center_r + 3):
-            for c in range(center_c - 2, center_c + 3):
+        for r in range(center_r - 10, center_r + 11):
+            for c in range(center_c - 10, center_c + 11):
                 if 0 <= r < rows and 0 <= c < cols:
                     feat[idx] = 1.0 if float(map_info[r][c]) != 0.0 else 0.0
                 idx += 1
