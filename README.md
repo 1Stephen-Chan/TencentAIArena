@@ -1,6 +1,6 @@
 ## 腾讯开悟智能体决策算法
 ### stable 稳定版本: 
-[baseline1.zip](stable/baseline1.zip) 区域赛初赛第一次天梯榜 平均得分 1576.18
+[baseline1-15k.zip](stable/baseline1-15k.zip) 区域赛初赛第一次天梯榜 平均得分 1576.18
 
 ### test 测试版本:
 
